@@ -1,0 +1,83 @@
+---
+claimed_at: 2026-11-03T18:22:19Z
+claimed_by: verksted-worker
+class: standard
+completed: 2026-11-03T18:22:19Z
+created: 2026-11-03T02:50:14Z
+depends_on:
+- 5
+- 6
+- 7
+id: 8
+priority: medium
+started: 2026-11-03T17:31:06Z
+status: done
+tags:
+- step-3
+- state
+title: 'Interruptions: claims with lease and generation, lost start confirmation,
+  two windows, GUI reconnect, Stop, unknown outcome'
+updated: 2026-11-03T18:22:19Z
+---
+
+docs/architecture.md §4 step 2, §5 and §7.3. SQLite: atomic claim + state change, rising claim generation fences stale confirmations, expired claim only reconciles. Lost confirmation is reconciled, never restarted; unclear outcome -> unknown, no automatic retry; Stop reported only when Hermes confirms; closing a tab is not a stop. Acceptance rows: two GUI windows + lost confirmation, GUI close/reopen, gateway abort, two sessions with concurrent Rückfragen.
+
+2026-11-03 06:02 Research (read-only, verksted-worker; Hermes ad2b705; repo 409221c; probes on Linux against throwaway gateways, raw canonical socket; NOT exercised on Windows, no Electron run — Desktop-side facts read only). [ex]=exercised, [rd]=read.
+
+STOP/cancel. Use prompt.cancel{session_id,admission_id}, not session.interrupt (admission-scoped; cannot stop the user's own later turn; answers "too late"). started -> reply status:started (=requested), receipt terminal/interrupted ~0.9 s later, include_result interrupted:true; message.complete says status interrupted / outcome cancelled [ex]. queued -> terminal/cancelled at once [ex]. terminal -> row unchanged, e.g. outcome completed = finished before the stop [ex]. unknown -> 4001 unknown_execution [ex]. prompt.cancel is refused 4001 runtime_draining while draining (gateway/drain_control.py:81-90) [rd] -> retry next poll. Viewer close never interrupts a turn (session_viewer_close.py:1-14,285-320) [rd]; k3 has no tab-close stop. Plan: store cancel_requested_at/cancel_sent_at; waiting_for_gui -> new final state `cancelled` locally (safe: create_requested is recorded+fenced before session.create); create_requested..toolsets_checked -> flag, refuse ->submit_requested, Desktop steps `cancelled`; submit_requested/running -> flag + ring; holder (or reconcile claimant, same identity) sends prompt.cancel (add to ALLOWED_CALLS, params exactly session_id+admission_id), step cancel_sent, track() confirms from the receipt. Tool reports cancel: requested|confirmed|too_late|not_started; "stopped" only on Hermes' terminal receipt. e2e FORBIDDEN keeps session.interrupt; prompt.cancel allowed only after a stored request.
+
+SEND. Same submission_id+text replays the terminal admission (same:true), other text -> 4001 admission_conflict [ex]; submit into a busy session queues (cap 32) [ex]; behind an unknown it stays queued [ex]. Rules: only on finished runs with a session, same parent, folder free, config/identity frozen; refuse while active, on unknown (paused FIFO), refused, cancelled. submission_id = <run>.submit.<n>, stored first. Schema v2: runs.turn_no + turns archive (run_id, turn, submission_id UNIQUE, admission_id, outcome, result_ref, ...); new active state send_waiting (in ACTIVE_STATES for the folder index); Desktop: resume -> checkInfo with lazy relaxed (toolset-check §6 step 6, D1 refuse if grown) -> submit_requested -> prompt.submit. Open point [rd, not probed]: a child without viewer is orphan-closed after sessions.orphan_end_grace_s (default 300 s) -> a later send resumes an ENDED session; test with grace 1 s.
+
+LOST CONFIRMATION / TWO WINDOWS / RECONNECT. Safe by fencing + idempotent RPCs (create by request_id+params, submit by submission_id+text [ex]). Cell coverage: create_requested x lost reply = e2e 7; running x window gone = e2e 4b; everything else unit-only (plugin.test.mjs fix 5/6/8, store fencing/concurrent-claim tests). Not covered by e2e: takeover in create_requested, gateway restart mid-turn, finished-turn reconcile. Wrong-give-up cell: submit_requested, session not lazy, nothing pending -> unknown/submit_unconfirmed although our turn may have finished (terminal rows are not in pending). PROPOSAL P1 (changes k3 decision 16): re-check with lazy relaxed and repeat the identical submit (Hermes replays or admits the only start). Lease 180/renew 30: windows are unthrottled only while a turn is in flight (electron/stream-throttle.ts, active-work; the parent blocked in `verksted wait` counts); otherwise Chromium default, intensive throttling ~1 wake/min -> renew ~60 s, still >=2 renewals per lease; sleep exceeds any lease -> reconcile only (correct). Keep 180/30.
+
+GATEWAY ABORT [ex: SIGKILL mid-turn + gateway ensure]: receipt unknown/outcome null; resume pending [{status unknown, input_id=<submission_id>}], running false; events.since count 0 truncated; cancel -> unknown_execution; new submit queues; prompt.resolve_unknown -> terminal/interrupted, no result, then the queue runs. Only automation rows auto-settle; Desktop rows stay paused; explicit last-viewer close resolves as interrupted, orphan reaps don't. k3 mapping (unknown/admission_unknown, never retried/resolved) is right; add a hint: open the session, discard ("Discard lost prompt") or resend there.
+
+RUECKFRAGE WITHOUT VIEWER [ex, subagent]: every Desktop turn uses batch clarify (client.ts:430 sets clarify_batch once the gateway reports canonical_clarify_batch); with no attached socket session_server_requests.py:172-173 returns None -> outcome timed_out, tool row status unanswered, terminal 0.26 s later, nothing parked, late viewer sees open_requests []. The plugin cannot opt out via the SDK. A clarify asked while a viewer is attached and then detached stays open (clarify.timeout 3600 s) and a late viewer answers via open_requests [ex]. Approvals: wait approvals.timeout (300 s) then fail closed "BLOCKED ... Silence is not consent", status blocked, command not run, outcome still completed [ex]; late viewer finds it in prompts[] [ex]. After the fact only receipt include_result result.messages shows unanswered/blocked [ex]. Plan: hold host.retainProfile(route) for the whole tracked run (not just create->submit), resume tracked started runs at once on gateway.ready (events.since does not attach), keep the resume tick; finished carries unanswered[] / blocked[] from result.messages; tool + SKILL tell the user. PROPOSAL P5: arch §5 assumes the child waits for "Session öffnen" — true for approvals only within approvals.timeout, for clarify only while a viewer is attached.
+
+CONCURRENT RUECKFRAGEN [ex]: srq- answers accepted only from a socket attached to that session with session:respond; event prompts keyed (session_id, execution_generation, prompt_id); cross-session answers ignored/expired/already_resolved; reverse-order answers reach their own request. Verksted's display key = connection + route profile + session_id (as openSession does). New e2e: two runs ask at once, answered in reverse order.
+
+AUDIT 9d [rd]: track() on a non-primary route dials a socket per tick (gateway.ts:1360-1380) and its session.resume arms an orphan close on each socket close. host.retainProfileSocket is a no-op for local routes; use host.retainProfile from tracking start, release on final/claim loss/dispose; refcounted per route scope -> one socket per secondary route. The shim has only a primary route: unit test only.
+
+Proposed e2e: cancel running/before-GUI/after-completion; send after finished; send refused while running/unknown; desktop restart after the turn finished (P1); gateway restart mid-turn -> unknown, no resubmit; takeover in create_requested; Rückfrage with no viewer -> unanswered; approval timeout -> blocked; two concurrent Rückfragen.
+
+Drift (not scope): track() counts 4001 runtime_draining and 5001 toward the 3 receipt failures (a drain >30 s makes a healthy run unknown); dispose() releases no claim (takeover waits the full lease); docs/hermes-interfaces.md:128 (clarify waits with nobody subscribed: per-question only) and :54 (retain must last the run); tests/e2e/vk_e2e/user.py:35-36 comment contradicted by probe (capabilities play no part). Schema: k8 and k10 both bump SCHEMA_VERSION — coordinate v2/v3. Proposals needing the maintainer: P1 decision 16, P2 state `cancelled`, P3 send_waiting + turns, P5 arch §5 wording.
+
+2026-11-03 06:03 Orchestrator decisions on the research proposals (pending maintainer review): P1 accepted — a run waiting on its submit confirmation in a non-fresh session with nothing pending re-checks toolsets and repeats the IDENTICAL submit (same submission_id + text); that is idempotent reconciliation, not a new start, so invariant 2 holds (reverses k3 decision 16). P2 accepted — new final state 'cancelled' for runs Hermes never saw; otherwise stopped only when the receipt confirms. P3 accepted — schema v2 with turn counter, turn archive and 'send_waiting'; send only on a finished run, refused while active or unknown. P5 — mitigate within public interfaces: keep the run's socket attached while tracking (retainProfile for the run's lifetime, also fixes audit 9d), re-attach on reconnect, report unanswered[]/blocked[] from the result; the arch §5 wording ('child waits for Session öffnen') becomes a proposal for the maintainer, not a silent change. Drift items (drain counted as failure, window close releases no claim) are in scope for k8. k8 and k10 go to ONE worker with ONE schema migration (v2).
+
+2026-11-03 17:35 Started implementation (verksted-worker): schema v2 shared with k10.
+
+Implementation (verksted-worker), together with k10 in ONE schema migration (v2). Hermes ad2b705b49 (.dev/hermes-agent). Linux only — NOT exercised on Windows, no real Desktop/Electron run. [ex]=exercised in e2e against the real backend, [unit]=unit tests only, [rd]=read at ad2b705.
+
+DECISIONS (mine, record for review):
+D-a cancel before submit ends `cancelled` at once for waiting_for_gui, create_requested, session_created, toolsets_checked, send_waiting (state_detail {reason: cancelled_before_submit, after: <state>}). Safe: the Desktop's next step is refused (bad_transition) and the window lets go quietly. Residue: a session.create already in flight may leave an empty child session.
+D-b no cancel_sent column: "sent" lives in the holding window's memory; prompt.cancel is idempotent (terminal → unchanged, unknown → unknown_execution), so a new holder asks again at most once.
+D-c send is allowed on `finished` and on `cancelled` runs that have a session_id (store.SENDABLE_STATES).
+D-d start_send expires the old claim (claim_expires_at=now) so a window takes the follow-up at once; the generation keeps rising.
+D-e runs.task/prompt_text/submission_id hold the CURRENT turn; earlier turns are archived in table `turns`; the tool view shows `turn`.
+D-j reconciling submit_requested: lazy session + stored stop → `cancelled` (reason never_admitted, nothing reached Hermes); a failed toolset check in a non-lazy session → unknown/submit_unconfirmed, never refused (our turn may have run). Lazy + failed check → refused (nothing was admitted).
+D-k a send_waiting run of another connection is skipped (left to it); a principal mismatch → refused identity_changed (nothing sent).
+D-o dispose() gives every claim back (REST release) and never stops a run. Whether the real Desktop window unload runs ctx.onDispose to completion is NOT verified [rd only]; if it does not, takeover waits out the 180 s lease.
+D-p transient = code 5001, reason runtime_draining, or no reply: not counted toward the three receipt refusals; prompt.cancel is asked again on the next track. unknown_execution and other refusals are not asked again (the receipt decides).
+D-q a blocked approval's reason is read from the tool row's error text: denied | timeout | blocked (texts tools/approval.py:742-790 [rd]).
+D-r default wait_seconds: cancel 30, send 60.
+D-s (bug found + fixed) the pre-claim connection check now compares only the connection: in the committed code a running child stored under a non-null principal subject was skipped by every window before the claim (subject compared against none). Local routes have subject null, so it never showed. Regression unit test added.
+D-t the retain (host.retainProfile) is taken in take() right after the claim and held until the run is final, the claim is lost, or the window is disposed (P5 + audit 9d). Rewritten unit claim: the k3 trace asserted a release right after the submit.
+D-u P1 rewritten unit claim: k3 "fix 8" asserted lazy:false + nothing pending → unknown; that cell now repeats the identical submit after the relaxed check (orchestrator P1). The lazy:false case whose set grew stays unknown.
+
+SCHEMA v2 (shared with k10): runs + cancel_requested_at, turn_no; new table turns(run_id, turn, submission_id UNIQUE, task, prompt_text, state, state_detail, admission_id, outcome, result_ref, cancel_requested_at, finished_at); states + send_waiting (active), cancelled (final); one-active-per-folder index rebuilt with the new state list. Migration in place in one BEGIN IMMEDIATE; a failed migration leaves the v1 file untouched [unit]; tested on a v1 store built by the committed code (fixture tests/agent/fixtures/store_v1.sql + make_store_v1.py).
+
+EXERCISED [ex]: e2e 12 cancel of a running turn → prompt.cancel {session_id, admission_id} once → receipt terminal/interrupted → tool cancel: confirmed, the late model answer is not the result. e2e 13 send → same child session, submission ids <run>.submit.1/.2, a session.resume between them, turn 1 archived. e2e 14 P1 cell → three lost submit replies, the turn finishes, the reconcile claim re-attaches (lazy false, nothing pending), the identical 4th prompt.submit is answered with the existing admission, the child model ran once. e2e 15 SIGKILL of the gateway mid-turn + gateway ensure → receipt unknown → run unknown/admission_unknown; window B sends no create, submit, cancel or resolve; the parent's status shows the "Nothing is retried … Session öffnen" hint.
+UNIT ONLY: retain held/released (final, claim loss, dispose); gateway.ready re-track at once; drain/5001/lost receipts not counted; prompt.cancel retry after runtime_draining/5001/no reply, not after unknown_execution; stop carried by a step answer or by the run list; send_waiting check with lazy false (grown set refused, other protocol refused); follow-up identity rules; resultNotes on the ad2b705 shapes (clarify responses[].status unanswered, terminal _error_json status blocked).
+NOT COVERED: e2e Rückfrage with no viewer → unanswered, approval timeout → blocked, two concurrent Rückfragen, takeover in create_requested, cancel before the GUI (unit only), a send after the child was orphan-closed (sessions.orphan_end_grace_s 300 s), real window unload firing dispose.
+
+CORRECTION to the 06:02 research note: at ad2b705 a replayed submit carries no `same: true`; an exact or terminal replay returns the existing admission row (hermes_state_runtime.py:128-162, retry_terminal_admission). P1 relies only on that; e2e 14 shows it.
+
+PROPOSALS for the maintainer (unchanged, now implemented): P1 (reverses k3 decision 16), P2 state cancelled, P3 send_waiting + turns, P5 arch §5 wording — "the child waits for Session öffnen" holds for approvals within approvals.timeout, for a clarify only while a viewer is attached.
+
+DRIFT (not scope, prose): docs/hermes-interfaces.md:54 (retain is now held for the run, not create→submit), :128 (a Desktop batch clarify with nobody attached ends at once as unanswered), :129 (unknown path now exercised); docs/windows-acceptance.md:290 still says cancel is "not in this build", no Windows rows for cancel/send/P1/gateway kill; tests/e2e/vk_e2e/user.py:35-36 comment; CLAUDE.md "Build / test: none yet".
+
+VERIFIED (2026-11-03, Linux, Hermes ad2b705b49): make test → agent 248 passed, desktop 77 passed, no skips; make doctor OK (1 tool, 1 hook); .dev/venv/bin/python -m pytest tests/e2e -q → 33 passed in 279.73s, no skips/xfails (a BrokenPipeError on stderr is the scripted model server writing to a connection the interrupted/killed turn dropped; nothing failed). git diff --check clean. Not committed. NOT exercised on Windows.
+
+Ready for review together with k10 (one schema v2). cancel/send/P1/lost confirmation/two windows/reconnect/gateway abort/P5 unanswered+blocked; decisions D-a…D-u in the note above. make test 248+77 green, doctor OK, e2e 33 passed (12 cancel, 13 send, 14 P1, 15 gateway kill). Tree commit-ready, not committed. Not exercised on Windows. Proposals P1/P2/P3/P5 against arch §4/§5 await the maintainer.
+
+2026-11-03 18:22 Committed e19d55b (k8+k10 share one schema v2 migration); docs follow-up 990a5b5

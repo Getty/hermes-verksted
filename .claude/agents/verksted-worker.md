@@ -36,5 +36,6 @@ what changed and why, plus a proposed commit subject and `Changes` entry — com
 
 ## Verification
 
-No test command yet. The first card that adds code sets one and adds it to `CLAUDE.md`; from
-then on that command runs green before `review`.
+`make test` (see `CLAUDE.md`) runs green before `review`. A change to the start path, the
+store or `desktop/plugin.js` also runs the Linux e2e suite, `.dev/venv/bin/python -m pytest
+tests/e2e -q` (real Hermes backend, Node stand-in for the Desktop renderer, ~4–5 min).

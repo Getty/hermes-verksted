@@ -1,0 +1,4 @@
+name: e2eprobe
+version: 0.0.1
+description: Harness probe for tests/e2e (not Verksted). One tool, one dashboard API, one Desktop part.
+provides_tools: [e2e_ping]

@@ -1,0 +1,37 @@
+---
+claimed_at: 2026-11-03T17:30:53Z
+claimed_by: verksted-worker
+class: standard
+completed: 2026-11-03T17:30:53Z
+created: 2026-11-03T02:50:11Z
+depends_on:
+- 4
+id: 6
+priority: medium
+started: 2026-11-03T05:36:51Z
+status: done
+tags:
+- step-2
+- windows
+title: 'Path checks on the executing backend: drive letters, spaces, umlauts, junctions,
+  WSL path space'
+updated: 2026-11-03T17:30:55Z
+---
+
+docs/architecture.md §6. Canonicalise and validate where the session runs. A Windows path is never passed unchecked into a WSL backend. Acceptance row: Windows folder with space and umlaut — file operation lands in the right folder, no new console.
+
+2026-11-03 05:53 Started (verksted-worker). Interfaces read at ad2b705: hermes_constants is_wsl / windows_path_to_wsl / wsl_unc_path_to_posix / translate_cwd_for_wsl_backend (:1221-1266; gateway/session_mutation_policy.py:41-47 applies the same translation to session.create cwd). Plan: injectable path flavour (ntpath/posixpath + fs stub) in verksted/paths.py; decisions follow with the implementation.
+
+2026-11-03 17:27 Decisions (mine, verksted-worker), verksted/paths.py:
+- Every check runs through an injectable Backend (path flavour + fs calls of the process that executes the tool); tests inject ntpath + fakefs.WinFS (simulated with ntpath — not exercised on Windows).
+- Canonical form: realpath strict (symlinks, junctions, 8.3 names as the OS expands them), then isdir. No Unicode normalisation either way (NFC/NFD stay different names); a name that is not valid Unicode is refused `bad_folder` (cannot be stored or sent).
+- Windows: drive paths only. \\?\X:\ accepted and stored WITHOUT the prefix (Hermes' tools need the plain form); a folder reachable only with the prefix → `path_too_long`. UNC (\\server\share, //server, \\?\UNC\, \\wsl.localhost\, \\localhost\C$) → `unc_path`; \\.\ and \\?\Volume{…} → `device_path`; a mapped network drive whose realpath is UNC → `unc_path` (v1 = lokale Arbeitsordner, §7). Drive-relative (C:x), root-relative (\x), relative → `bad_folder`.
+- Lock key (one active run per folder): normcase of the canonical path (case-folded on Windows); on a WSL backend /mnt/<drive>/ paths are lower-cased too (drvfs is case-insensitive by default), Linux paths stay case-sensitive.
+- WSL: only when hermes_constants.is_wsl() — a Windows path is mapped with Hermes' translate_cwd_for_wsl_backend and the mapped path is then checked like any other; \\wsl.localhost|wsl$\<distro> must name WSL_DISTRO_NAME (Hermes' wsl_unc_path_to_posix ignores the distro); anything unmappable → `windows_path`. Off WSL a Windows path on a Linux backend → `windows_path`, never passed on.
+- files: ≤50 relative paths; absolute, drive or rooted entries refused; both the lexical normpath and the link-resolved path must stay inside the canonical folder → `bad_files`.
+- docs/windows-acceptance.md: new section G–K (drive-letter case, space+umlaut+files, junction into/out of the workspace incl. the registration refusal, \\?\ and long paths, WSL backend given C:\), each with steps, expected observation and the §7 row; A–F untouched; 'WSL path spaces (k6)' dropped from 'Not covered here'.
+Drift / limits: §7 has no own row for drive letters, junctions or WSL (scenarios name the row they belong to plus §6). Real Windows realpath (GetFinalPathNameByHandle, NTFS upcase table, LongPathsEnabled) and a real WSL drvfs are not exercised — only simulated. macOS case-insensitive volumes are not folded.
+
+2026-11-03 17:27 Ready for review (verksted-worker). Same runs as k5: make test 190 + 58 passed, e2e 28 passed, 0 skipped, make doctor OK. tests/agent/test_paths.py: real-Linux (space+umlaut bytes, NFC/NFD, non-UTF-8 name, Windows path off WSL, symlink escape in files), ntpath-simulated Windows (drive case, umlaut/NFD, 8.3, junctions, \\?\ and path_too_long, UNC/device/mapped refusals, files) — simulated with ntpath, not exercised on Windows — and WSL with Hermes' real translate_cwd_for_wsl_backend at ad2b705 (is_wsl patched; no real WSL). test_tool.py: one active run per folder across spellings (ntpath-simulated), link out of a registered workspace refused. New rules seen failing against 409221c (3 real-Linux tests are regression guards: the old code already kept bytes and refused symlink escapes). Not exercised on Windows: docs/windows-acceptance.md G–K are for the maintainer. Not committed; commit-ready.
+
+2026-11-03 17:30 Committed a6365b9 (combined with k5). Moved to done although k4 is still in review awaiting the Windows run; expected. Not exercised on Windows.

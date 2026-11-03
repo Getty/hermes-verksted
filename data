@@ -1,0 +1,34 @@
+---
+block_reason: 'needs maintainer: installed Hermes on Windows is v0.22.5 (bf0203a)
+  < requires_hermes >=0.22.6 - update Hermes or re-check interfaces against v0.22.5'
+blocked: true
+claimed_at: 2026-11-03T03:40:38Z
+claimed_by: verksted-worker
+class: standard
+created: 2026-11-03T02:50:06Z
+id: 1
+priority: high
+started: 2026-11-03T03:11:48Z
+status: in-progress
+tags:
+- step-1
+- interfaces
+title: 'Pin the target: record the installed Hermes Desktop and backend build on Windows'
+updated: 2026-11-03T20:27:11Z
+---
+
+The design was checked against Hermes ad2b705 (docs/architecture.md, header). Record the Desktop and backend build the maintainer actually runs on Windows (native or WSL backend?), then check every interface the design relies on against it: host.profileRoutes, host.requestProfile, ctx.rest/ctx.socket, host.openSession, runtime.describe, session.create (source, cwd, request_id, toolsets), prompt.submit (submission_id), prompt.receipt, session.resume, session.events.since. Output: the build, and per call: present / differs / missing. Needs the maintainer for the Windows side.
+
+2026-11-03 03:12 Started source side (read-only): comparing every design interface at ad2b705 vs v0.22.6 in .dev/hermes-agent; output goes to docs/hermes-interfaces.md.
+
+2026-11-03 03:19 Desktop SDK side read at ad2b705 (identical at v0.22.6 for sdk/, contrib/, api/plugins.ts, api/client.ts, plugin-profile-routes.ts): route = {connectionId, mode, primary?, profile, targetProfile}; ctx.rest is pinned to the window's ACTIVE (connection, profile), no route param; the local canonical adapter rewrites session.create source to 'gui' (apps/desktop/src/api/canonical-protocol.ts:548), legacy/remote dial strips request_id (client.ts:67-71); openSession also takes {route}; session sequences need host.retainProfile(route) or the gateway detaches the session (store/gateway.ts:1384-1395). Backend half + gateway contracts still in progress. Side note: a bare 'hermes --version' without HERMES_HOME created ~/.hermes (did not exist before); moved to .dev/backup-k1/, ~/.hermes is gone again.
+
+2026-11-03 03:33 Source side done; matrix in docs/hermes-interfaces.md (untracked, commit-ready). ad2b705 vs v0.22.6: every interface the design names is PRESENT at both, no wire difference (only Daybreak, approval detection, CORS, plugin-WS gate, tool-cache diffs). Corrections to the design, as proposals C1-C22 in the doc: (1) the Desktop canonical adapter forces session.create source to 'gui' — 'tool' never reaches a local gateway via the SDK; (2) create is durably idempotent on canonical (session id = sha256(profile, principal, request_id); a changed param under the same request_id is refused), but legacy/remote strips request_id -> proposal: v1 requires runtime.describe + durable-admission-v1; (3) prompt.submit requires submission_id and a subscription on the calling socket; prompt.receipt takes admission_id, not submission_id; (4) effective tools before the first prompt via session.info (tools, enabled_toolsets, mcp_servers) — the step-1 'Vorlauf' Hermes extension is not needed at toolset level (MCP tools appear only once the server is connected; see k2); (5) no 'waiting' state: Rückfrage/Freigabe come from snapshot prompts[] and clarify/approval.request events; a denied approval still ends outcome 'completed'; (6) interrupt = requested; confirm via receipt terminal; (7) ctx.rest reaches only the window's ACTIVE (connection, profile), conflicting with 'Ablage beim Elternprofil' for multi-profile; (8) openSession takes {route}, use it; (9) parent session/profile in the handler: host-set session_id kwarg + get_session_env(HERMES_SESSION_KEY/PROFILE), not forgeable from args (exercised); (10) agent->Desktop signal: broadcast_plugin_event, a doorbell to every window, polling stays mandatory; (11) tool call deadline 420 s -> wait <= ~240 s. Exercised on Linux against throwaway homes .dev/home-k1, .dev/home-k1-gw, .dev/home-k1-pl; nothing exercised on Windows.
+
+2026-11-03 03:40 Source-side doc committed as 4640e46 (docs/hermes-interfaces.md). Still blocked on the maintainer's Windows build record.
+
+2026-11-03 20:27 Windows build recorded by the Windows machine agent (read-only, docs/hermes-interfaces.md "Windows check" steps 1-3; Desktop GUI not opened, steps 4-5 not run).
+- Desktop: packaged app built locally by install.ps1 -IncludeDesktop from the Hermes checkout: C:\Users\getty\Share\Hermes\hermes-agent\apps\desktop\release\win-unpacked\Hermes.exe. Not MSIX (Get-AppxPackage empty), exe ProductVersion 0.0.0. resources\install-stamp.json: commit bf0203a794a07aac3ff764972ab9087baa4e4f4e, builtAt 2026-11-01T05:36:53Z, dirty false, source local, distribution desktop-app, updateMechanism self, payload bootstrap, tag/displayVersion null. desktop.log has no "install stamp" line.
+- Backend: native Windows, same checkout. hermes --version: "Hermes Agent v0.22.5 (2026.9.24) · stable · local bf0203a794a0", install method git, Python 3.14.9. Checkout detached at v0.22.5 (git describe v0.22.5-0-gbf0203a794), one local change hermes_cli/models_catalog_static.py (+3/-1, installer's model catalog refresh). Gateway "default" running manually, not as a service. Desktop connections.json: only "local" (This device), primary. WSL distros Ubuntu and docker-desktop exist, stopped, not registered as gateways.
+- Homes and plugin roots: HERMES_HOME=C:\Users\getty\Share\Hermes is a permanent user environment variable; %LOCALAPPDATA%\hermes does not exist. Desktop userData %APPDATA%\Hermes. Plugins: Share\Hermes\plugins (only skilletor 0.7.0, user, enabled), Share\Hermes\desktop-plugins (empty). which hermes: Share\Hermes\bin\hermes.exe.
+Consequences: (1) The installed build is v0.22.5 = bf0203a, older than pinned ad2b705 and tag v0.22.6; verksted/plugin.yaml requires_hermes ">=0.22.6" refuses to load here. Maintainer's call: update Hermes on Windows to v0.22.6/ad2b705 (touches the real home), or re-check the interface tables against v0.22.5 on Linux and relax requires_hermes. (2) Because HERMES_HOME is set user-wide, a throwaway run is isolated only when the Desktop is started from the shell that set both variables (windows-acceptance.md §0); a Desktop started from a shortcut or Explorer uses the real home (data-paths.mjs resolves env.HERMES_HOME first).

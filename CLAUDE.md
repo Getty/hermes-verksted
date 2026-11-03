@@ -5,7 +5,8 @@ Hermes workspace; the `verksted` tool lets the Hermes main agent start or resume
 Hermes session in it through the Desktop SDK and collect the result. First acceptance
 target: the official Hermes Desktop on **Windows**. The karr board follows the three
 implementation steps of the design; the package is built and tested on Linux, the Windows
-acceptance runs are still open (`docs/windows-acceptance.md`).
+acceptance runs are still open (`docs/windows-acceptance.md`). **On Windows, start with
+[`docs/windows-handoff.md`](docs/windows-handoff.md).**
 
 - **Design:** [`docs/architecture.md`](docs/architecture.md) (German) — read first. It
   names the Hermes revision its interfaces were checked against.
@@ -14,8 +15,11 @@ acceptance runs are still open (`docs/windows-acceptance.md`).
 - **Board:** `karr list --compact`.
 - **Build / test:** `make dev-env` once (pinned Hermes ad2b705 + venv in `.dev/`), then
   `make test` — pytest on `tests/agent` (incl. a contract test against the pinned Hermes)
-  plus `node --test` on `tests/desktop`; green before `review`. `make doctor` runs
-  `hermes plugins doctor`; every target uses the throwaway home `.dev/home`.
+  plus `node --test` on `tests/desktop`; green before `review`. `make test-e2e` runs the
+  Linux end-to-end suite (real Hermes backend, Node stand-in for the Desktop renderer;
+  ~8 min, one run at a time — two wipe each other's `.dev/e2e`). `make doctor` runs
+  `hermes plugins doctor`, `make package` builds `dist/verksted-<version>.zip` from HEAD,
+  `make install` copies HEAD into `.dev/home`; every target stays under `.dev/`.
 
 ## Delegation
 

@@ -196,6 +196,25 @@ mismatch because `uv.lock` records the override (`pm/pip_check.py`, per the comm
 override at the tag. The failure itself was observed while the venv was built; I did not
 re-run it.
 
+## 8 Observed: a slow git turns `requires_hermes` against the plugin
+
+Seen once in the e2e suite (2026-11-03, `test_18`, machine load ~10 with memory pressure): the
+gateway logged `Plugin 'verksted' skipped: requires hermes >=0.22.6, running 0.21.5`, and the
+parent got "Tool 'verksted' does not exist". Cause, read at ad2b705: without an install stamp a
+source checkout resolves its version from live git (`hermes_cli/version_info.py`,
+`_git_version_info`): `git tag --merged HEAD --list 'v[0-9]*'` under a 3 s timeout (`_run_git`).
+On a timeout it falls back to the nearest CalVer tag's `pyproject.toml` (`_calver_release_version`,
+here `v2026.9.24` → 0.21.5), and the load-time `requires_hermes` gate skips the plugin; the only
+trace is a WARNING in `logs/errors.log`. In `.dev/hermes-agent` (61 641 commits, no commit-graph)
+the call took 1.7–2.0 s idle; after `git commit-graph write --reachable` 0.07 s, and `make
+dev-env` now writes one. The version is cached per process, so one slow start skips the plugin
+for that gateway's whole life.
+
+Relevance beyond the dev box: packaged builds (the Desktop app, Docker, Nix) read the install
+stamp and are not affected; a backend run from a git checkout (e.g. a source install in WSL) is.
+If Verksted is missing on such a backend, look for that WARNING first. Whether to report this
+upstream is the maintainer's call.
+
 ## Consequences for Verksted
 
 These are proposals only. Changing a decision in `docs/architecture.md` is the maintainer's

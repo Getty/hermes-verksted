@@ -60,6 +60,9 @@ def e2e(request, model):
     if not failed:
         shutil.rmtree(root, ignore_errors=True)
     assert not forced, f"processes had to be SIGKILLed at teardown: {[i for e in made for i in e.backend.forced_info]}"
+    for e in made:
+        if getattr(e, "load_error", None):
+            raise e.load_error
 
 
 class Env:
@@ -97,7 +100,14 @@ class Env:
 
     def teardown(self) -> list[int]:
         self.close_clients()
-        return self.backend.stop()
+        forced = self.backend.stop()
+        self.load_error = None
+        if self.backend.endpoint is not None:
+            try:
+                self.backend.check_plugins_loaded()
+            except HarnessError as exc:  # raised by the fixture after every env is torn down
+                self.load_error = exc
+        return forced
 
 
 @pytest.fixture(scope="module")
@@ -121,3 +131,6 @@ def shared_e2e_factory():
         forced += env.teardown()
     model.stop()
     assert not forced, f"processes had to be SIGKILLed at teardown: {[i for e in envs.values() for i in e.backend.forced_info]}"
+    for e in envs.values():
+        if getattr(e, "load_error", None):
+            raise e.load_error

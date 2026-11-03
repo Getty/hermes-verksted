@@ -32,8 +32,9 @@ class UserChat:
         self._closed = False
         threading.Thread(target=self._reader, daemon=True).start()
         if advertise_server_requests:
-            # What the app's socket does on gateway.ready. Without it the owner treats the viewer as one
-            # that cannot answer server requests.
+            # What the app's socket does on gateway.ready. Mirrored for fidelity only: the k8 probe showed it
+            # plays no part -- a batch clarify reaches any socket attached to the session (with
+            # session:respond), advertised or not.
             self.call("client.capabilities", server_requests=True)
 
     def _reader(self):

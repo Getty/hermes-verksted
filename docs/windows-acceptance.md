@@ -3,8 +3,9 @@
 Manual scenarios for the maintainer (or a Claude Code session on the Windows box). They are the
 real acceptance of card k4 and of the Windows rows of `docs/architecture.md` §7 that the step-1
 prototype (k3) touches. Nothing here has been run on Windows. Each scenario names the Linux
-stand-in test that mirrors it (`tests/e2e/test_verksted_e2e.py`, run with
-`.dev/venv/bin/python -m pytest tests/e2e -v`); a green stand-in says nothing about drive letters,
+stand-in test that mirrors it (`tests/e2e/test_verksted_e2e.py` and `tests/e2e/test_verksted_k11_e2e.py`,
+run with `.dev/venv/bin/python -m pytest tests/e2e -v`; real Hermes backend at `ad2b705`, the Desktop
+window is a Node shim); a green stand-in says nothing about drive letters,
 the real Desktop renderer, the packaged app or a console window. Report results as
 "exercised on Windows build `<commit>`", per scenario, pass / fail / not run.
 
@@ -23,23 +24,42 @@ Fixed vocabulary in the Desktop part (German, from `verksted/desktop/plugin.js`)
    (`docs/hermes-interfaces.md` Windows check 4a). If the packaged app ignores the variables,
    stop: installing into the maintainer's own Hermes home or Desktop (`%LOCALAPPDATA%\hermes`)
    needs the maintainer's explicit go-ahead. A Claude Code session must ask first.
-3. **Install the package** (copy, not symlink, on Windows): `verksted\` from the repo to
-   `C:\verksted-k4\home\plugins\verksted\`. Do not run `hermes plugins enable` (it re-resolves the
-   whole dependency environment into the home); edit `C:\verksted-k4\home\config.yaml` instead:
+3. **Install the package** (copy, not symlink, on Windows). From a release zip
+   (`make package` on the Linux box writes `dist\verksted-<version>.zip`; its top folder is
+   `verksted\`), in PowerShell with the two throwaway variables set (the same shell later starts
+   the Desktop, so it inherits them):
+   ```powershell
+   $env:HERMES_HOME = 'C:\verksted-k4\home'
+   $env:HERMES_DESKTOP_USER_DATA_DIR = 'C:\verksted-k4\desktop'
+   New-Item -ItemType Directory -Force "$env:HERMES_HOME\plugins" | Out-Null
+   # update: remove the old copy first, so no file of an older build survives
+   Remove-Item -Recurse -Force "$env:HERMES_HOME\plugins\verksted" -ErrorAction SilentlyContinue
+   Expand-Archive .\verksted-0.1.0.zip -DestinationPath "$env:HERMES_HOME\plugins"   # yields plugins\verksted\
+   Get-ChildItem "$env:HERMES_HOME\plugins\verksted" -Recurse -Force |
+     Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }          # must print nothing (no links)
+   # update: the Desktop half is copied once and kept while its mtime looks current - delete it
+   # BEFORE the next Rescan, or an old plugin.js stays (scenario S)
+   Remove-Item -Recurse -Force "$env:HERMES_HOME\desktop-plugins\verksted" -ErrorAction SilentlyContinue
+   ```
+   Without a zip, copy the repo's `verksted\` folder to `$env:HERMES_HOME\plugins\verksted`
+   (`Copy-Item -Recurse`). Do not run `hermes plugins enable` or `hermes plugins install` (they
+   re-resolve the whole dependency environment into the home); edit `C:\verksted-k4\home\config.yaml`
+   instead:
    ```yaml
    plugins:
      enabled: [verksted]
    approvals:
      mode: manual      # a dangerous command must prompt (scenario B)
-     timeout: 300
+     timeout: 300      # scenario P shortens it to 20
    tools:
      tool_search:
        enabled: "off"  # optional: without it the main agent reaches `verksted` only via
                        # tool_search -> tool_call (plugin tools are deferred at ad2b705)
    ```
    Keep the `_config_version` Hermes wrote. Restart the gateway (`hermes gateway restart --detach`
-   with `HERMES_HOME` set) so the agent half and `dashboard/plugin_api.py` load.
-4. **Enable the Desktop half**: Capabilities, Plugins, "Verksted" on (it is opt-in, per window
+   in that shell) so the agent half and `dashboard/plugin_api.py` load. Packaged-app check: if
+   the Desktop ignores the two variables, stop (see step 2).
+4. **Enable the Desktop half**: Capabilities, Plugins, Rescan, then "Verksted" on (it is opt-in, per window
    origin). Both halves are needed; without the Desktop half a run stays "wartet auf Hermes Desktop".
 5. **Test folder with space and umlaut**: create `C:\verksted k4\Ärger\work` (and, for scenario D,
    a second folder `C:\verksted k4\Ärger\work2`). A model that can follow instructions is needed;
@@ -62,8 +82,10 @@ Start each scenario in a fresh parent chat of the Desktop (the "parent").
      use tool_search to find `verksted`, then tool_call.)
   2. Watch the status bar chip and the Verksted page: "wird gestartet", then "läuft", then "fertig".
   3. Check `C:\verksted k4\Ärger\work\result.txt`.
-- **Expected:** the parent gets a structured result (`state: finished`, `outcome: completed`, the
-  child's last answer); `result.txt` is in `Ärger\work` and nowhere else; the child session is
+- **Expected:** the parent gets a structured result (`state: finished`, `outcome: completed`,
+  `result_block`, `summary` and `outputs` from the child's closing `<verksted-result>` block, plus
+  the clipped final answer in `result`; k10). If the child named `result.txt`, it is in `outputs`
+  with its relative path. `result.txt` is in `Ärger\work` and nowhere else; the child session is
   listed in the sessions list (it is a `gui` session at this Hermes: the SDK replaces `source`);
   no console window appeared at any step; no `Verksted` error in DevTools.
 - **Record:** the run `handle`, the child session id, the exact path the file landed in.
@@ -112,7 +134,7 @@ Start each scenario in a fresh parent chat of the Desktop (the "parent").
   was written (the child's answer quotes the denial). Control (optional): repeat and choose
   "Approve once" — the file must then exist, proving the command can run on this machine.
 - **If the approval is not answered in time** (`approvals.timeout`) Hermes denies it; the run
-  must not show "Freigabe erforderlich" for ever.
+  must not show "Freigabe erforderlich" for ever (scenario P).
 
 ## D Result and resume reach the same parent
 
@@ -284,7 +306,155 @@ write `slow.txt`"* with `wait_seconds: 0`.
   `/home/<user>/verksted-k6`; the other distro name is refused `windows_path`. Step 4: refused
   `windows_path`. No path reaches `session.create` in its Windows form.
 
+## Stop, follow-up, interruptions and results (k8, k10)
+
+Scenarios L–S check the rows of `docs/architecture.md` §7 about Stop, lost confirmations, a
+restarting backend, Rückfragen and approvals nobody answers, result outputs, and the lean profile.
+Preconditions as in §0. Use `wait_seconds: 0` and ask for the tool's JSON result verbatim wherever a
+`state`, `cancel` or `result_block` value is the point. Each scenario names the Linux stand-in in
+`tests/e2e/test_verksted_e2e.py` / `tests/e2e/test_verksted_k11_e2e.py` (real Hermes backend `ad2b705`,
+shimmed window). **None of them has been exercised on Windows.**
+
+### L Cancel a running turn (and before any window)
+
+- **Design:** §4/§5 step 3 "Stop" (no §7 row of its own): a stop counts only when Hermes confirms it; a closed tab is not a stop.
+- **Linux stand-ins:** `test_12_cancel_of_a_running_turn_is_confirmed_by_the_receipt`;
+  `test_21_cancel_before_any_desktop_window_ends_cancelled_and_nothing_reaches_hermes`.
+- **Steps:**
+  1. Start a slow run (*"run `ping -n 120 127.0.0.1`, then write `slow.txt`"*), `wait_seconds: 0`.
+     Wait for "läuft".
+  2. Parent: *"Cancel the verksted run `<handle>` and show me the result."* Watch the Verksted page:
+     "wird gestoppt", then "fertig" (outcome `interrupted`).
+  3. Close the child's tab instead of cancelling on a second slow run: the run keeps going.
+  4. With the Desktop part switched **off** (Capabilities, Plugins), start a run; it stays
+     "wartet auf Hermes Desktop". Cancel it from the parent. Switch the Desktop part on again.
+- **Expected:** step 2: the tool answers `cancel: requested`, later `cancel: confirmed` with
+  `outcome: interrupted`; `slow.txt` does not appear after the stop; the child answer produced after
+  the stop is not the result. Step 3: no stop; a closed tab never interrupts. Step 4: `state:
+  cancelled`, `cancel: not_started`; after the Desktop part is on again no session is created for
+  that run and the child chat never receives the task. A cancel after the turn finished answers
+  `cancel: too_late` and the result is unchanged.
+- **Not exercised on Windows.**
+
+### M Follow-up turn with send, also after the child session was closed
+
+- **§7 row:** "GUI schließen und erneut öffnen" (a follow-up reaches the same child session; no row of its own for `send`).
+- **Linux stand-ins:** `test_13_send_runs_a_follow_up_turn_in_the_same_child_session`;
+  `test_24_send_after_the_child_was_orphan_closed` (idle grace shortened there).
+- **Steps:**
+  1. Finish a run (scenario A). Parent: *"Send the verksted run `<handle>` this follow-up: append
+     the word `zwei` to `result.txt`; wait for it."*
+  2. Close the child's tab and every chat that shows it, leave the Desktop window open for more
+     than `sessions.orphan_end_grace_s` (default 300 s) and send a second follow-up.
+- **Expected:** step 1: the same `handle` and `session_id`, `turn: 2`, one new prompt in the **same**
+  child chat, no second session in the list. Step 2: the follow-up runs in the same session (Hermes
+  resumes an orphan-ended session); if Hermes refuses, the tool says so as a refusal and nothing is
+  retried. Record which.
+- **Not exercised on Windows.**
+
+### N Lost submit reply after the turn finished (P1)
+
+- **§7 row:** "Zwei GUI-Fenster und verlorene Startbestätigung" (Kein automatischer Doppelstart).
+- **Linux stand-ins:** `test_14_a_lost_submit_reply_after_the_turn_finished_repeats_the_identical_submit`,
+  `test_20_takeover_in_create_requested_repeats_the_identical_create_and_starts_one_session`.
+- **Reproducible only with luck on Windows.** Start a short run and kill the Desktop window
+  (Task Manager) within a second of "wird gestartet"; reopen it after the child finished. Record "not
+  run" if the timing cannot be hit.
+- **Expected:** exactly one child session and one prompt in its history; the run ends "fertig" (or
+  "unbekannt" with the reason shown, never a second prompt). Nothing is started twice.
+- **Not exercised on Windows.**
+
+### O Backend killed mid-turn: unknown, nothing retried
+
+- **§7 row:** "Gateway-Abbruch während einer Aktion" (unclear outcome becomes visible `unknown`; no blind retry).
+- **Linux stand-in:** `test_15_a_gateway_killed_mid_turn_leaves_the_run_unknown_and_nothing_is_retried`.
+- **Steps:**
+  1. Start a slow run, wait for "läuft".
+  2. Kill the backend process of the throwaway home (`Stop-Process` on the Python process that
+     `hermes gateway status` names) and let the Desktop start it again.
+  3. Parent: *"Check the verksted run `<handle>`."*
+- **Expected:** "unbekannt" (`state: unknown`, reason `admission_unknown`); the hint says nothing is
+  retried and to use "Session öffnen" to discard or resend the lost prompt there. No second prompt
+  appears in the child chat on its own; the slow command is not run twice.
+- **Not exercised on Windows.**
+
+### P Rückfrage with nobody attached, approval nobody answers
+
+- **§7 row:** "Verweigerte Freigabe" (the proposed action does not run); the Rückfrage case is design §5, no row of its own.
+- **Linux stand-ins:** `test_17_a_rueckfrage_asked_with_no_viewer_is_reported_unanswered`,
+  `test_18_an_approval_nobody_answers_ends_blocked_and_the_command_does_not_run`.
+- **Steps:**
+  1. Set `approvals.timeout: 20` in the throwaway `config.yaml`, restart the gateway. Start a run
+     whose task is to run the dangerous command of scenario C. Do not open the child. After 20 s
+     check the run and the parent's result.
+  2. Start a run whose first act is a clarify question; close the Desktop window within a second of
+     "wird gestartet" and reopen it after a minute (the question was asked while nobody viewed the child).
+- **Expected:** step 1: the command did not run (`denied.txt` absent), the run ends "fertig" with
+  `outcome: completed`, the result carries `blocked` (`reason: timeout`) and the page shows
+  "Nicht freigegeben: …". Step 2: the result carries `unanswered` with the question and the page
+  shows "Rückfrage ohne Antwort: …"; the child went on with an assumption and Verksted says so.
+  Neither the plugin nor the main agent answered anything.
+- **Not exercised on Windows.**
+
+### Q Two Rückfragen at once, answered in reverse order
+
+- **§7 row:** "Zwei Sessions mit gleichzeitigen Rückfragen" (each answer reaches only its own request).
+- **Linux stand-in:** `test_19_two_concurrent_rueckfragen_are_answered_in_reverse_order_each_reaching_its_own_run`.
+- **Steps:** start two runs in two folders (`work`, `work2`), each asking one clarify question
+  (*"What is the project called? Write it into name.txt"*). Open both children with "Session öffnen".
+  Answer the second run's question first (`zwei`), then the first (`eins`).
+- **Expected:** `work\name.txt` holds `eins`, `work2\name.txt` holds `zwei`; each run's result mentions
+  its own answer only.
+- **Not exercised on Windows.**
+
+### R Result outputs: not_found, outside_workspace, symlink escape; no block
+
+- **Design:** §4 step 5 (result with summary and output paths; no §7 row of its own); paths are checked on the executing backend.
+- **Linux stand-ins:** `test_16_the_result_block_is_checked_against_the_workspace_root`,
+  `test_22_no_result_block_is_reported_missing_although_the_file_exists`,
+  `test_23_an_unclosed_result_block_is_reported_unparsable`; the Windows path rules run on `ntpath`
+  in `tests/agent/test_result.py` (simulated).
+- **Steps:** register `C:\verksted k4` as workspace (as scenario I step 5) and keep the junction
+  `work\out` -> `C:\verksted-k4-outside` from scenario I. Run in `C:\verksted k4\Ärger\work` with the
+  task *"write `notes.md`; in your closing block list `notes.md`, `ghost.md`,
+  `C:\verksted-k4-outside\secret.txt`, `out\secret.txt` and `C:\Windows\win.ini`"*. Then a run with
+  the task *"write `plain.md` and answer in one sentence, no block"*.
+- **Expected:** `outputs` has only `notes.md` (relative path, size, time); `missing` has `ghost.md`
+  `not_found` and `outside_workspace` for the secret (absolute), the junction path and `win.ini`
+  (a drive-relative or UNC form: `bad_path`); the Verksted page lists "→ notes.md" and "✗ … (reason)".
+  Second run: `result_block: missing`, no outputs although `plain.md` exists; the page says "kein
+  Ergebnisblock". Case variants (`NOTES.MD`), 8.3 names and `\\?\` forms: record what happens.
+- **Not exercised on Windows.**
+
+### S Lean profile (MCP) and a stale Desktop half after an update
+
+- **§7 row:** "Schlankes Profil" (Nicht benötigte MCP-Server werden nicht zusätzlich gestartet).
+- **Linux stand-ins:** `test_lean_profile_starts_no_unneeded_mcp`,
+  `test_fat_profile_mcp_toolset_is_dropped_but_the_server_still_runs` (an enabled server starts with the
+  gateway; Verksted sends `no_mcp`, so the child is not offered it, but the process runs). The stale
+  Desktop half has **no** Linux stand-in; `tests/agent/test_package.py` only checks that both manifests
+  carry one version.
+- **Steps (MCP):** in the throwaway `config.yaml` add `mcp_servers:` with one server that writes a line
+  to a file when it starts (a `python -c` that appends to `C:\verksted-k4\spawn.txt` and then reads
+  stdin) and set `enabled: false`; restart the gateway; run a task with `toolsets: [file]`. Repeat with
+  `enabled: true`.
+- **Expected (MCP):** disabled: `spawn.txt` is never written, the child's tool list has no MCP tool.
+  Enabled: the server starts once with the gateway (one line), the run is not refused, the child is not
+  offered its tools, and the run starts no second process. Whether Windows leaves a console window for
+  the server: record it.
+- **Steps (stale half):** install build 1, enable the Desktop part, run once. Update to build 2 as in
+  §0.3 **without** deleting `desktop-plugins\verksted`, Rescan, and compare
+  `(Get-FileHash "$env:HERMES_HOME\plugins\verksted\desktop\plugin.js").Hash` with the hash of
+  `$env:HERMES_HOME\desktop-plugins\verksted\plugin.js`. Then repeat with the delete step.
+- **Expected (stale half):** record whether the hashes differ after a plain overwrite (the Desktop keeps
+  its copy while the mtime looks current) and that they are equal after the delete and Rescan; also run
+  `hermes plugins doctor` and note whether it flags the stale copy. A run started by a stale half must
+  not be trusted; the report names the build of each half.
+- **Not exercised on Windows.**
+
 ## Not covered here
 
-Slim profiles and MCP (§7 "Schlankes Profil"), two simultaneous Rückfragen (k8), a gateway kill
-mid-action (k8), Stop (`cancel`, not in this build). Those rows stay open.
+Real window unload firing the Desktop part's dispose (a run's claim is given back at once instead of
+after the 180 s lease: watch whether a second window takes a run over within seconds after the first one
+is closed, scenario D), Hermes Desktop restart during `send_waiting`, and everything in the Windows path
+rows that `ntpath` only simulates. Those stay open.

@@ -43,13 +43,50 @@ def config_version() -> int:
     return int(m.group(1))
 
 
+_VERSION_PROBE = (
+    "import time; t=time.monotonic(); "
+    "from hermes_cli.version_info import get_version_info as g; i=g(); "
+    "print(i.base_version, i.source, round(time.monotonic()-t, 2))"
+)
+_preflight_done = False
+
+
+def _check_hermes_version() -> None:
+    """The pinned checkout must resolve a version that satisfies verksted/plugin.yaml ``requires_hermes``.
+
+    A git-checkout install resolves its version with ``git tag --merged HEAD`` under a 3 s timeout and falls
+    back to the nearest CalVer tag (an older version) on a timeout; Hermes then silently skips the plugin
+    (``Plugin 'verksted' skipped: requires hermes ...``). Slow here = flaky there, so fail loud up front.
+    This proves the test process's value only; the gateway's own value is checked via its log
+    (``Backend.check_plugins_loaded``)."""
+    m = re.search(r'^requires_hermes:\s*["\']?([^"\'\n]+)', (REPO / "verksted" / "plugin.yaml").read_text(), re.M)
+    if not m:
+        return
+    spec = m.group(1).strip()
+    code = _VERSION_PROBE + f"; from packaging.specifiers import SpecifierSet as S; from packaging.version import Version as V; print(V(i.base_version) in S({spec!r}))"
+    r = subprocess.run([str(VENV / "bin" / "python"), "-c", code], cwd=str(HERMES_SRC), capture_output=True, text=True, timeout=120)
+    out = r.stdout.split()
+    if r.returncode != 0 or len(out) < 4:
+        raise HarnessError(f"could not resolve the pinned Hermes version: {(r.stderr or r.stdout)[-400:]}")
+    version, source, secs, ok = out[0], out[1], float(out[2]), out[3] == "True"
+    if not ok or secs > 1.5:
+        raise HarnessError(
+            f"pinned Hermes resolves version {version} ({source}) in {secs}s; plugin.yaml requires {spec} and the "
+            "resolver gives up after 3 s (falling back to an older CalVer tag, the plugin is then skipped). "
+            "Run `make dev-env` (writes a git commit-graph into .dev/hermes-agent)")
+
+
 def preflight() -> None:
     """Fail loud (not skip) when the pinned test Hermes is not there."""
+    global _preflight_done
     if not HERMES_BIN.exists():
         raise HarnessError(f"{HERMES_BIN} missing: the dev venv is not built (make dev-env)")
     head = subprocess.run(["git", "-C", str(HERMES_SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if head != PINNED:
         raise HarnessError(f".dev/hermes-agent is at {head or '?'}, expected pinned {PINNED}")
+    if not _preflight_done:
+        _check_hermes_version()
+        _preflight_done = True
 
 
 class Backend:
@@ -90,6 +127,10 @@ class Backend:
             "model": {"provider": "custom", "default": "local-wire-stub", "base_url": self.model_url},
             "auxiliary": {"title_generation": {"enabled": False}},
             "plugins": {"enabled": sorted(self.plugins)},
+            # The gateway's passive banner/version check (hermes_cli/banner.prefetch_update_check ->
+            # source_check.check_for_updates(passive=True)) runs `git ls-remote` against github.com from the
+            # .dev/hermes-agent checkout. The harness must not touch the network: switch it off (ad2b705).
+            "updates": {"check": False},
         }
         for k, v in self.extra_config.items():
             if isinstance(v, dict) and isinstance(cfg.get(k), dict):
@@ -155,7 +196,24 @@ class Backend:
         self.endpoint = payload["endpoint"]
         if self.endpoint["profile_id"] != str(self.home):
             raise HarnessError(f"gateway runs {self.endpoint['profile_id']}, expected {self.home}")
+        self.check_plugins_loaded()
         return self
+
+    def check_plugins_loaded(self) -> None:
+        """Fail with Hermes' own ``Plugin '<name>' skipped: ...`` line when a plugin this harness installed did
+        not load (version gate, missing dependency, ...). Reads the gateway's logs, which hold the value the
+        gateway process itself computed. Called after start and again at teardown (discovery may be lazy)."""
+        found = []
+        for name in ("errors.log", "agent.log", "gateway.log"):
+            f = self.home / "logs" / name
+            if not f.exists():
+                continue
+            for line in f.read_text(errors="replace").splitlines():
+                m = re.search(r"Plugin '([^']+)' skipped: ", line)
+                if m and m.group(1) in self.plugins and line not in found:
+                    found.append(line)
+        if found:
+            raise HarnessError("a plugin did not load in the gateway:\n" + "\n".join(found[:5]))
 
     def stop(self) -> list[int]:
         """Stop the owner. Returns pids that had to be SIGKILLed (a clean stop returns [])."""

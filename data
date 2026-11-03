@@ -1,0 +1,19 @@
+{"action":"move","agent":"verksted-worker","detail":"done","task_id":8,"ts":"2026-11-03T18:22:19Z"}
+{"action":"edit","agent":"verksted-worker","detail":"review","task_id":10,"ts":"2026-11-03T18:22:20Z"}
+{"action":"move","agent":"verksted-worker","detail":"done","task_id":10,"ts":"2026-11-03T18:22:20Z"}
+{"action":"create","agent":"Torsten Raudssus","detail":"backlog","task_id":11,"ts":"2026-11-03T18:22:54Z"}
+{"action":"move","agent":"verksted-worker","detail":"in-progress","task_id":9,"ts":"2026-11-03T18:22:58Z"}
+{"action":"move","agent":"verksted-test-writer","detail":"in-progress","task_id":11,"ts":"2026-11-03T18:22:59Z"}
+{"action":"edit","agent":"verksted-worker","detail":"in-progress","task_id":9,"ts":"2026-11-03T18:28:02Z"}
+{"action":"edit","agent":"verksted-test-writer","detail":"in-progress","task_id":11,"ts":"2026-11-03T18:38:27Z"}
+{"action":"handoff","agent":"verksted-test-writer","detail":"review","task_id":11,"ts":"2026-11-03T18:42:41Z"}
+{"action":"edit","agent":"verksted-worker","detail":"in-progress","task_id":9,"ts":"2026-11-03T18:45:57Z"}
+{"action":"handoff","agent":"verksted-worker","detail":"review","task_id":9,"ts":"2026-11-03T18:46:05Z"}
+{"action":"edit","agent":"verksted-worker","detail":"review","task_id":9,"ts":"2026-11-03T18:53:00Z"}
+{"action":"edit","agent":"verksted-test-writer","detail":"review","task_id":11,"ts":"2026-11-03T19:02:34Z"}
+{"action":"edit","agent":"verksted-worker","detail":"review","task_id":9,"ts":"2026-11-03T19:22:55Z"}
+{"action":"edit","agent":"verksted-test-writer","detail":"review","task_id":11,"ts":"2026-11-03T19:31:54Z"}
+{"action":"edit","agent":"verksted-worker","detail":"review","task_id":9,"ts":"2026-11-03T19:34:23Z"}
+{"action":"move","agent":"verksted-worker","detail":"done","task_id":9,"ts":"2026-11-03T19:34:24Z"}
+{"action":"edit","agent":"verksted-test-writer","detail":"review","task_id":11,"ts":"2026-11-03T19:34:25Z"}
+{"action":"move","agent":"verksted-test-writer","detail":"done","task_id":11,"ts":"2026-11-03T19:34:25Z"}

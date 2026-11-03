@@ -237,6 +237,8 @@ reply.
 
 ## 6 The check algorithm
 
+*Read together with §11: the k3 audit corrected steps 2–5 and §7.*
+
 **Inputs**
 
 - `L`: the toolset list resolved from `.verksted.yaml`.
@@ -429,3 +431,31 @@ revisited without changing the store schema.
   thing to revisit.
 - **C1 accepted.** Children are identified by the stored session id; `source` is not relied
   on (the SDK sends `gui`).
+
+## 11 Corrections after the k3 audit and fix pass
+
+Found by the read-only audit of k3 and confirmed by the e2e suite (`tests/e2e`, Linux
+stand-in against ad2b705). The code follows these, §6/§7 above are the original analysis.
+
+- **Step 2: never send a `title`.** `session.create` resolves a title to an existing session
+  before `request_id` is read (`session_controls.py:467-492`); a title derived from the folder
+  name reused another folder's session. A per-run unique title is unsafe too (Hermes prefers the
+  latest `"<title> #N"`), so Verksted sends none and the Desktop part refuses a titled create.
+- **Step 3 with M2:** the comparison is `E ⊆ effective ⊆ E ∪ {verksted}`, not
+  `set(effective) == E`.
+- **Step 4 / §7, the empty selection:** with Verksted's own toolset enabled, the effective set
+  of `[]` is `['verksted']` and `tools.show.total` is 1. The rule is: `tools.show` may list only
+  Verksted's own tool, and its `total` must equal what it lists (e2e
+  `test_10_an_empty_toolset_list_runs_with_verksted_own_tool_only`). The fail-open inventory
+  (`session_local_inventory.py:146-152`, `enabled_toolsets: []` when `_policy_tools` raises)
+  has no marker in any reply; the independent `tools.show` count is the only signal, and in the
+  default case an empty list after a non-empty first read is not checkable.
+- **Step 5, reconnects:** the Desktop part counts connection epochs (`gateway.ready`, the
+  gateway state leaving `open`) and re-attaches with an explicit `session.resume` and checks
+  again whenever the epoch moved before a submit attempt. Only the primary socket's reconnects
+  are seen; one on a secondary socket, or inside an SDK await, is not (open point for Windows).
+- **Reconcile at `submit_requested`:** the toolsets are checked before every (re)submit, not
+  only when `lazy` is true; our own pending admission is adopted; any other state ends
+  `unknown/submit_unconfirmed` without a submit.
+- **`runtime.describe` gate:** only `-32601` (method not found) means a legacy route and
+  refuses; any other error leaves the run claimable for a later attempt.

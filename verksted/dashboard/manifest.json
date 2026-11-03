@@ -1,0 +1,8 @@
+{
+  "name": "verksted",
+  "label": "Verksted",
+  "description": "Run and claim store for the Verksted Desktop part.",
+  "version": "0.1.0",
+  "api": "plugin_api.py",
+  "tab": {"hidden": true}
+}

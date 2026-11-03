@@ -1,0 +1,236 @@
+"""Verksted plugin API, mounted by Hermes under ``/api/plugins/verksted``.
+
+The Desktop part reaches it through ``ctx.rest`` to list claimable runs, claim one (lease plus
+claim generation) and record each start step. Host authentication is the dashboard's own
+middleware, which runs before this router (a native ``X-Hermes-Gateway-Ticket`` from Desktop, or
+the session token); this module adds no credential of its own and reads the authenticated
+principal from ``request.state.native_http_principal``.
+
+Hermes imports this file standalone by path, possibly in another process than the agent plugin,
+so the shared ``store.py`` one folder up is loaded by path too. Request and response bodies
+never use a top-level ``profile`` key: for native grants the host checks such a key against the
+grant's home and answers 403 ``profile_scope_mismatch``.
+
+SQLite work runs in the threadpool (``run_in_threadpool`` copies the request context, so the
+host's per-request profile scope still applies), never on the server's event loop.
+
+Business refusals answer HTTP 200 with ``{"ok": false, "code": ...}`` so the Desktop part always
+gets the reason; ``ctx.rest`` turns non-2xx answers into bare errors.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, Request
+from starlette.concurrency import run_in_threadpool
+
+LEASE_DEFAULT_S = 180.0
+LEASE_MIN_S = 30.0
+LEASE_MAX_S = 600.0
+OWNER_MAX = 128
+
+
+def _load_store():
+    path = Path(__file__).resolve().parent.parent / "store.py"
+    spec = importlib.util.spec_from_file_location("verksted_dashboard_store", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"verksted: cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_vstore = _load_store()
+router = APIRouter()
+
+
+def _store():
+    """The store of the profile this request is scoped to (the host binds it per request)."""
+    return _vstore.Store.for_active_profile()
+
+
+def _profile_home() -> str:
+    from hermes_constants import get_hermes_home
+    return str(get_hermes_home().resolve())
+
+
+def _same_home(a: str, b: str) -> bool:
+    def norm(p: str) -> str:
+        return os.path.normcase(os.path.realpath(p))
+    return norm(a) == norm(b)
+
+
+def _principal(request: Request) -> dict[str, Any]:
+    native = getattr(request.state, "native_http_principal", None)
+    if isinstance(native, dict):
+        return {k: native.get(k) for k in ("instance_id", "profile_id", "subject", "purpose")}
+    return {"auth": "token"}
+
+
+def _refuse(code: str, message: str, **extra: Any) -> dict[str, Any]:
+    return {"ok": False, "code": code, "message": message, **extra}
+
+
+async def _body(request: Request) -> dict[str, Any]:
+    try:
+        data = await request.json()
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _owner(body: dict[str, Any]) -> str:
+    owner = body.get("owner")
+    if not isinstance(owner, str) or not owner or len(owner) > OWNER_MAX:
+        raise _vstore.StoreError("bad_owner", "owner must be a non-empty string of at most 128 characters")
+    return owner
+
+
+def _generation(body: dict[str, Any]) -> int:
+    gen = body.get("generation")
+    if isinstance(gen, bool) or not isinstance(gen, int):
+        raise _vstore.StoreError("bad_generation", "generation must be the integer the claim returned")
+    return gen
+
+
+def _lease(body: dict[str, Any]) -> float:
+    raw = body.get("lease_s", LEASE_DEFAULT_S)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raw = LEASE_DEFAULT_S
+    return max(LEASE_MIN_S, min(LEASE_MAX_S, float(raw)))
+
+
+def _summary(run: dict[str, Any], now: float) -> dict[str, Any]:
+    detail = run.get("state_detail") or {}
+    out = {
+        "run_id": run["run_id"],
+        "state": run["state"],
+        "folder": run["target_dir"],
+        "task_preview": (run.get("task") or "")[:200],
+        "parent_profile": run["parent_profile"],
+        "created_at": run["created_at"],
+        "updated_at": run["updated_at"],
+        "last_known_at": run.get("last_known_at"),
+        "expected_toolsets": run.get("expected_toolsets"),
+        "effective_toolsets": run.get("effective_toolsets"),
+        "session_id": run.get("session_id"),
+        "admission_id": run.get("admission_id"),
+        "identity": {k: run.get(k) for k in ("connection_id", "route_profile", "target_profile",
+                                             "profile_id", "instance_id")},
+        "claim": {"owner": run.get("claim_owner"), "generation": run.get("claim_generation"),
+                  "expires_at": run.get("claim_expires_at"),
+                  "live": (run.get("claim_expires_at") or 0) > now},
+        "outcome": run.get("outcome"),
+    }
+    if run["state"] == "running":
+        out["receipt_status"] = detail.get("receipt_status")
+        out["prompts"] = detail.get("prompts") or []
+    if run["state"] in ("refused", "unknown"):
+        out["reason"] = detail.get("reason")
+        out["detail"] = detail.get("detail")
+    if run["state"] == "finished":
+        result = run.get("result_ref") or {}
+        out["result_preview"] = (result.get("final_response") or "")[:500]
+    return out
+
+
+def _work(run: dict[str, Any], now: float) -> dict[str, Any]:
+    """What a claimant needs to start or reconcile: the stored calls, exactly as stored, and the
+    stored identity including the principal subject it was requested under (lists leave it out)."""
+    summary = _summary(run, now)
+    return {**summary, "identity": {**summary["identity"], "subject": run.get("subject")},
+            "request_id": run["request_id"], "create_params": run["create_params"],
+            "submission_id": run["submission_id"], "prompt_text": run["prompt_text"]}
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _call(fn, *args: Any, **kwargs: Any):
+    return run_in_threadpool(fn, *args, **kwargs)
+
+
+def _list(claimable_only: bool) -> dict[str, Any]:
+    store, now = _store(), _now()
+    runs = store.claimable_runs(limit=20) if claimable_only else store.list_runs(limit=50)
+    return {"ok": True, "profile_home": _profile_home(), "runs": [_summary(r, now) for r in runs]}
+
+
+def _claim(run_id: str, body: dict[str, Any], principal: dict[str, Any]) -> dict[str, Any]:
+    owner = _owner(body)
+    # The route's runtime.describe profile_id; null only when describe failed (a legacy route),
+    # where the claim exists to record the refusal.
+    profile_id = body.get("profile_id")
+    if profile_id is not None:
+        if not isinstance(profile_id, str) or not profile_id:
+            return _refuse("bad_profile_id", "profile_id must be the route's runtime.describe profile_id or null")
+        home = _profile_home()
+        if not _same_home(profile_id, home):
+            return _refuse("profile_mismatch", "the route's gateway serves another profile home than this store",
+                           profile_home=home)
+    granted = _store().claim(run_id, owner, principal=principal, lease_s=_lease(body))
+    # The subject this claim is authenticated as: the Desktop part compares it with the stored one
+    # before it repeats any start call (the store compares it again on every step).
+    return {"ok": True, "generation": granted["generation"], "expires_at": granted["expires_at"],
+            "mode": granted["mode"], "subject": principal.get("subject"), "run": _work(granted["run"], _now())}
+
+
+def _renew(run_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": True, **_store().renew(run_id, _owner(body), _generation(body), lease_s=_lease(body))}
+
+
+def _release(run_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": True, **_store().release(run_id, _owner(body), _generation(body))}
+
+
+def _step(run_id: str, body: dict[str, Any], principal: dict[str, Any]) -> dict[str, Any]:
+    name = body.get("step")
+    if not isinstance(name, str):
+        return _refuse("bad_step", "step must be a state name")
+    data = body.get("data")
+    run = _store().record_step(run_id, _owner(body), _generation(body), name,
+                               data if isinstance(data, dict) else {}, principal=principal)
+    return {"ok": True, "run": _summary(run, _now())}
+
+
+async def _answer(fn, *args: Any) -> dict[str, Any]:
+    try:
+        return await _call(fn, *args)
+    except _vstore.StoreError as exc:
+        return _refuse(exc.code, str(exc), **exc.extra)
+
+
+@router.get("/runs")
+async def list_runs() -> dict[str, Any]:
+    return await _answer(_list, False)
+
+
+@router.get("/runs/claimable")
+async def claimable() -> dict[str, Any]:
+    return await _answer(_list, True)
+
+
+@router.post("/runs/{run_id}/claim")
+async def claim(run_id: str, request: Request) -> dict[str, Any]:
+    return await _answer(_claim, run_id, await _body(request), _principal(request))
+
+
+@router.post("/runs/{run_id}/renew")
+async def renew(run_id: str, request: Request) -> dict[str, Any]:
+    return await _answer(_renew, run_id, await _body(request))
+
+
+@router.post("/runs/{run_id}/release")
+async def release(run_id: str, request: Request) -> dict[str, Any]:
+    return await _answer(_release, run_id, await _body(request))
+
+
+@router.post("/runs/{run_id}/step")
+async def step(run_id: str, request: Request) -> dict[str, Any]:
+    return await _answer(_step, run_id, await _body(request), _principal(request))

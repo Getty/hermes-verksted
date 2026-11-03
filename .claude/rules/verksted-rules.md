@@ -21,7 +21,7 @@ parent session. Read first: `docs/architecture.md` (German); its invariants are 
 | Commits, `Changes`, card → done, release audit | `verksted-release-manager` |
 | Read-only research, audit, interface check against a Hermes build | `verksted-worker` ("read-only, change nothing") |
 
-Behavior-relevant = everything in the plugin package — `plugin.yaml`, the Python tool and
+Behavior-relevant = everything in the plugin package (root `verksted/`) — `plugin.yaml`, the Python tool and
 state store, `dashboard/`, `desktop/plugin.js`, the bundled Hermes skill
 `skills/verksted/SKILL.md` (it steers the Hermes main agent) — and the tests. README and other
 prose are not. A changed decision in `docs/architecture.md` is the maintainer's call: propose

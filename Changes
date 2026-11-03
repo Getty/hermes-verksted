@@ -1,0 +1,9 @@
+Revision history for Verksted
+
+{{$NEXT}}
+  - verksted tool (run, status, wait; send and cancel refuse for now)
+    stores every run with all start ids before anything starts it; SQLite
+    run and claim store with claim generations; plugin API for claims and
+    start steps; Desktop part that starts the run as a regular Hermes
+    session after the toolset check and reports its result; make dev-env,
+    make test, make doctor.

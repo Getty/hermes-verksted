@@ -1,0 +1,10 @@
+name: verksted
+version: 0.1.0
+description: "Hand a bounded task to a regular Hermes session in a workspace folder and collect its result. Needs the Verksted Desktop part enabled in Hermes Desktop, which starts the session."
+author: Torsten Raudssus
+kind: standalone
+requires_hermes: ">=0.22.6"
+provides_tools:
+  - verksted
+provides_hooks:
+  - post_compaction

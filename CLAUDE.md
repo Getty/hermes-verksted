@@ -3,16 +3,19 @@
 Hermes Agent plugin package, working name **Verksted**: a folder becomes a persistent
 Hermes workspace; the `verksted` tool lets the Hermes main agent start or resume a regular
 Hermes session in it through the Desktop SDK and collect the result. First acceptance
-target: the official Hermes Desktop on **Windows**. No code yet — the karr board follows
-the three implementation steps of the design.
+target: the official Hermes Desktop on **Windows**. The karr board follows the three
+implementation steps of the design; the package is built and tested on Linux, the Windows
+acceptance runs are still open (`docs/windows-acceptance.md`).
 
 - **Design:** [`docs/architecture.md`](docs/architecture.md) (German) — read first. It
   names the Hermes revision its interfaces were checked against.
 - **Rules + delegation:** shared house rules via the skilletor bundle `getty-house@getty`;
   lanes and hazards in `.claude/rules/verksted-rules.md` (auto-loaded).
 - **Board:** `karr list --compact`.
-- **Build / test:** none yet — the first card that adds code sets the command and records
-  it here.
+- **Build / test:** `make dev-env` once (pinned Hermes ad2b705 + venv in `.dev/`), then
+  `make test` — pytest on `tests/agent` (incl. a contract test against the pinned Hermes)
+  plus `node --test` on `tests/desktop`; green before `review`. `make doctor` runs
+  `hermes plugins doctor`; every target uses the throwaway home `.dev/home`.
 
 ## Delegation
 
@@ -33,9 +36,10 @@ delegates rather than loading them. `verksted-core` (the design invariants) is o
 under `.claude/skills/`; `hermes-plugin-engineering`, the git and the karr skills are
 installed by skilletor (`.claude/skilletor.json`).
 
-## Planned package layout
+## Package layout
 
-From the design, step 3. Names not fixed there are set by the first card that needs them.
+From the design, step 3. The package root is `verksted/` (an install copies only that folder,
+not `tests/`, `docs/` or `.dev/`); the paths below are relative to it.
 
 | Path | Contents |
 |---|---|

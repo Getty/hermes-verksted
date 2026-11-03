@@ -9,6 +9,7 @@ import pytest
 
 from fakefs import WinFS
 from verksted import paths, tool
+from verksted import result as result_mod
 from verksted.store import Store
 
 PRINCIPAL = {"subject": "user-1"}
@@ -23,6 +24,7 @@ class FakeHost:
                  profile="default", profile_home="/homes/default"):
         self.t = 10_000.0
         self.store_obj = Store.at_path(store_path, clock=self.now)
+        self.store_obj_path = store_path
         self.ctx = dict(session_id=session_id, session_key=session_key, chat_id=chat_id, source="desktop",
                         profile=profile, profile_home=profile_home, backend_platform="linux")
         self.rings = 0
@@ -264,10 +266,161 @@ def test_registered_workspaces_come_from_the_plugin_settings(host, workspace, tm
     assert run_now(host, workspace)["error"]["code"] == "bad_settings"
 
 
-def test_send_and_cancel_are_not_in_this_build(host):
-    for action in ("send", "cancel"):
-        out = call(host, {"action": action, "handle": "vk-x"})
-        assert out["error"]["code"] == "not_implemented"
+def test_send_and_cancel_check_the_parent_binding(host, workspace, tmp_path):
+    handle = run_now(host, workspace)["handle"]
+    stranger = FakeHost(tmp_path / "data.db", session_id="other-parent", session_key="route-other")
+    for args in ({"action": "cancel", "handle": handle}, {"action": "send", "handle": handle, "task": "x"},
+                 {"action": "cancel", "handle": "vk-missing"}):
+        assert call(stranger, args)["error"]["code"] == "not_found"
+    assert host.store_obj.get_run(handle)["state"] == "waiting_for_gui"
+
+
+def _to_running(host, handle):
+    g = _make_child(host, handle, "local-child")
+    s = host.store_obj
+    s.record_step(handle, "w1", g, "toolsets_checked", {"identity": IDENTITY}, principal=PRINCIPAL)
+    s.record_step(handle, "w1", g, "submit_requested", {"identity": IDENTITY}, principal=PRINCIPAL)
+    s.record_step(handle, "w1", g, "running", {"identity": IDENTITY, "admission_id": "adm"}, principal=PRINCIPAL)
+    return g
+
+
+def _finish(host, handle, g, *, outcome="completed", text="done", result=None):
+    host.store_obj.record_step(handle, "w1", g, "finished",
+                               {"identity": IDENTITY, "outcome": outcome, "final_response": text,
+                                **({"result": result} if result else {})}, principal=PRINCIPAL)
+
+
+def test_the_submitted_prompt_asks_for_the_result_block(host, workspace):
+    (workspace / "README.md").write_text("x")
+    run = host.store_obj.get_run(run_now(host, workspace, files=["README.md"])["handle"])
+    root = run["resolved_config"]["workspace"]
+    assert run["prompt_text"].endswith(result_mod.request_text(root))
+    assert f"relative to the folder you work in, {workspace.resolve()}" in run["prompt_text"]
+
+
+def test_cancel_before_the_gui_ends_the_run_at_once(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    rings = host.rings
+    out = call(host, {"action": "cancel", "handle": handle})
+    assert out["cancel"] == "not_started" and out["state"] == "cancelled" and out["label"] == "abgebrochen"
+    assert out["reason"] == "cancelled_before_submit" and host.rings == rings  # nobody to ask
+    assert "nothing ran" in out["hint"]
+    assert run_now(host, workspace)["ok"]  # the folder is free
+
+
+def test_cancel_of_a_running_turn_is_only_requested_until_hermes_confirms(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    g = _to_running(host, handle)
+    out = call(host, {"action": "cancel", "handle": handle, "wait_seconds": 0})
+    assert out["cancel"] == "requested" and out["state"] == "running" and out["label"] == "wird gestoppt"
+    assert out["cancel_requested"] is True and "only when Hermes confirms" in out["hint"]
+    assert host.rings == 2
+
+    def hermes_stops(h):
+        if h.slept >= 4 and h.store_obj.get_run(handle)["state"] == "running":
+            h.store_obj.renew(handle, "w1", g, lease_s=600)
+            _finish(h, handle, g, outcome="interrupted", text="Operation interrupted")
+    host.on_sleep = hermes_stops
+    out = call(host, {"action": "cancel", "handle": handle})
+    assert out["cancel"] == "confirmed" and out["state"] == "finished" and out["outcome"] == "interrupted"
+    assert "partial" in out["hint"]
+
+
+def test_a_stop_after_the_turn_finished_is_too_late(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    _finish(host, handle, _to_running(host, handle))
+    out = call(host, {"action": "cancel", "handle": handle})
+    assert out["cancel"] == "too_late" and out["outcome"] == "completed"
+
+
+def test_send_continues_a_finished_run_in_the_same_session(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    _finish(host, handle, _to_running(host, handle), text="first")
+    rings = host.rings
+    out = call(host, {"action": "send", "handle": handle, "task": "Now the CHANGES file", "wait_seconds": 0})
+    assert out["ok"] and out["state"] == "send_waiting" and out["turn"] == 2 and host.rings == rings + 1
+    assert out["session_id"] == "local-child" and out["handle"] == handle
+    run = host.store_obj.get_run(handle)
+    assert run["submission_id"] == f"{handle}.submit.2" and run["task"] == "Now the CHANGES file"
+    assert run["prompt_text"].startswith("Now the CHANGES file")
+    assert run["prompt_text"].endswith(result_mod.request_text(run["resolved_config"]["workspace"]))
+    assert [t["turn"] for t in host.store_obj.turns(handle)] == [1]
+
+
+def test_send_is_refused_while_the_run_is_active_or_its_outcome_unknown(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    assert call(host, {"action": "send", "handle": handle, "task": "x"})["error"]["code"] == "run_active"
+    g = _to_running(host, handle)
+    out = call(host, {"action": "send", "handle": handle, "task": "x"})
+    assert out["error"]["code"] == "run_active" and out["error"]["state"] == "running"
+    host.store_obj.record_step(handle, "w1", g, "unknown", {"reason": "admission_unknown"})
+    assert call(host, {"action": "send", "handle": handle, "task": "x"})["error"]["code"] == "outcome_unknown"
+    assert call(host, {"action": "send", "handle": handle, "task": " "})["error"]["code"] == "bad_args"
+
+
+def test_an_unknown_outcome_tells_how_to_resolve_it_in_the_child(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    g = _to_running(host, handle)
+    host.store_obj.record_step(handle, "w1", g, "unknown", {"reason": "admission_unknown"})
+    out = call(host, {"action": "status", "handle": handle})
+    assert "Session öffnen" in out["hint"] and "discard the lost prompt or send it again" in out["hint"]
+    assert "Nothing is retried" in out["hint"]
+
+
+def test_the_finished_view_reports_the_checked_outputs(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    check = {"block": "ok", "summary": "Fixed it.", "root": str(workspace), "truncated": False,
+             "outputs": [{"path": f"{workspace}/README.md", "relative": "README.md", "kind": "file", "size": 4,
+                          "mtime": 0.0}],
+             "missing": [{"path": "ghost.md", "reason": "not_found"}]}
+    _finish(host, handle, _to_running(host, handle), text="answer", result=check)
+    out = call(host, {"action": "status", "handle": handle})
+    assert out["result_block"] == "ok" and out["summary"] == "Fixed it." and out["result"] == "answer"
+    assert out["outputs"] == [{"path": f"{workspace}/README.md", "relative": "README.md", "kind": "file",
+                               "size": 4, "modified_at": "1970-01-01T00:00:00+00:00"}]
+    assert out["missing"] == [{"path": "ghost.md", "reason": "not_found"}]
+    assert out["result_truncated"] is False and "result_block_detail" not in out
+    assert "not who wrote it" in out["hint"]
+
+
+def test_a_finished_run_without_a_block_says_so_and_names_no_files(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    check = {"block": "unparsable", "detail": "no </verksted-result> after the last <verksted-result>",
+             "summary": None, "outputs": [], "missing": []}
+    _finish(host, handle, _to_running(host, handle), text="I wrote a.md", result=check)
+    out = call(host, {"action": "status", "handle": handle})
+    assert out["result_block"] == "unparsable" and out["outputs"] == [] and out["summary"] is None
+    assert out["result_block_detail"].startswith("no </verksted-result>")
+    assert "Do not guess files" in out["hint"]
+
+
+def test_unanswered_questions_and_blocked_commands_are_reported(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    g = _to_running(host, handle)
+    host.store_obj.record_step(handle, "w1", g, "finished",
+                               {"identity": IDENTITY, "outcome": "completed", "final_response": "x",
+                                "unanswered": [{"question": "Which file?"}],
+                                "blocked": [{"command": "rm -rf build", "reason": "timeout"}]},
+                               principal=PRINCIPAL)
+    out = call(host, {"action": "status", "handle": handle})
+    assert out["unanswered"] == [{"question": "Which file?"}]
+    assert out["blocked"] == [{"command": "rm -rf build", "reason": "timeout"}]
+    assert "got no answer" in out["hint"] and "did not run" in out["hint"]
+
+
+def test_a_result_recorded_by_schema_1_is_shown_without_a_block(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    g = _to_running(host, handle)
+    _finish(host, handle, g, text="old answer")
+    conn = sqlite3.connect(host.store_obj_path)
+    conn.execute("UPDATE runs SET result_ref=? WHERE run_id=?",
+                 (json.dumps({"session_id": "s", "admission_id": "a", "final_response": "old answer",
+                              "truncated": False}), handle))
+    conn.commit()
+    conn.close()
+    out = call(host, {"action": "status", "handle": handle})
+    assert out["result_block"] == "missing" and "earlier Verksted build" in out["result_block_detail"]
+    assert out["result"] == "old answer" and out["outputs"] == []
 
 
 def test_bad_folder_and_config_answer_structured_errors(host, workspace, tmp_path):

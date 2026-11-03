@@ -144,10 +144,13 @@ export class GatewayClient {
   // mode 'fail_before_send': the caller sees an error and nothing is sent.
   // mode 'merge_result': the reply is shallow-merged with `merge` before the caller sees it (e.g. a
   //   runtime.describe whose capabilities lack durable-admission-v1).
-  inject(method, mode, times = 1, merge = null) { this.injections.push({ method, mode, times, merge }) }
+  // `prefix` ({param: string}): only calls whose params start with these strings count, e.g.
+  //   {submission_id: 'vk-'} hits the plugin's child submits and leaves the test's own calls alone.
+  inject(method, mode, times = 1, merge = null, prefix = null) { this.injections.push({ method, mode, times, merge, prefix }) }
 
-  #takeInjection(method) {
-    const i = this.injections.find(x => x.method === method && x.times > 0)
+  #takeInjection(method, params) {
+    const hits = x => !x.prefix || Object.entries(x.prefix).every(([k, v]) => typeof params?.[k] === 'string' && params[k].startsWith(v))
+    const i = this.injections.find(x => x.method === method && x.times > 0 && hits(x))
     if (i) i.times--
     return i
   }
@@ -169,7 +172,7 @@ export class GatewayClient {
 
   async #request(method, params, timeoutMs, entry) {
     const generation = this.connectionGeneration
-    const inj = this.#takeInjection(method)
+    const inj = this.#takeInjection(method, params)
     if (inj?.mode === 'fail_before_send') { entry.injected = inj.mode; throw new Error(`injected failure before send: ${method}`) }
 
     await this.#attachForRequest(method, params)

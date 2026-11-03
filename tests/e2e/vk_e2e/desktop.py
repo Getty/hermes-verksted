@@ -122,8 +122,9 @@ class DesktopWindow:
         log = sorted(self.state()["rpcLog"], key=lambda c: c.get("wire_seq", 10**9))
         return [c for c in log if method is None or c["method"] == method]
 
-    def inject(self, method: str, mode: str, times=1, merge: dict | None = None):
-        return self.cmd("inject", method=method, mode=mode, times=times, merge=merge)
+    def inject(self, method: str, mode: str, times=1, merge: dict | None = None, prefix: dict | None = None):
+        """``prefix`` ({param: str}): only calls whose params start with these strings are hit."""
+        return self.cmd("inject", method=method, mode=mode, times=times, merge=merge, prefix=prefix)
 
     def reconnect(self):
         return self.cmd("reconnect")

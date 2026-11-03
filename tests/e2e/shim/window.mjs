@@ -26,7 +26,7 @@
 //
 // Control commands (Python: vk_e2e/desktop.py):
 //   state | events {since} | tick {id?} | rpc {method, params} | rest {path, opts} | reconnect |
-//   inject {method, mode, times} | user.respondServerRequest {id, result} | close
+//   inject {method, mode, times, merge?, prefix?} | user.respondServerRequest {id, result} | close
 import fs from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
@@ -301,7 +301,7 @@ const commands = {
   },
   rpc: async ({ method, params, timeoutMs }) => client.request(method, params ?? {}, timeoutMs), // test-side direct call, same client
   rest: async ({ path: p, opts }) => pluginRest(p, opts ?? {}),
-  inject: async ({ method, mode, times, merge }) => { client.inject(method, mode, times ?? 1, merge ?? null); return true },
+  inject: async ({ method, mode, times, merge, prefix }) => { client.inject(method, mode, times ?? 1, merge ?? null, prefix ?? null); return true },
   reconnect: async () => { await client.close(); await client.connect(); return true },
   disconnect: async () => { await client.close(); return true },
   'user.respondServerRequest': async ({ id, result }) => { client.respondServerRequest(id, result); return true },

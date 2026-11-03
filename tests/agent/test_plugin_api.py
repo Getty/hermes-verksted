@@ -310,3 +310,83 @@ def test_refusals_are_answered_with_their_reason(api):
     summary = api.get("/runs")["runs"][0]
     assert summary["state"] == "refused" and summary["reason"] == "toolsets_exceeded"
     assert json.dumps(summary)  # plain JSON
+
+
+def _to_running(api, rid, gen):
+    api.step(rid, gen, "create_requested", {"identity": IDENTITY})
+    api.step(rid, gen, "session_created", {"identity": IDENTITY, "session_id": "s-1"})
+    api.step(rid, gen, "toolsets_checked", {"identity": IDENTITY})
+    api.step(rid, gen, "submit_requested", {"identity": IDENTITY})
+    return api.step(rid, gen, "running", {"identity": IDENTITY, "admission_id": "adm-1"})
+
+
+def test_finished_checks_the_named_outputs_against_the_workspace_root(api, tmp_path):
+    # k10: the plugin API parses the closing block and checks each path on the backend; whatever
+    # result the Desktop part sends along is ignored.
+    root = tmp_path / "Ärger ws"
+    step = root / "workflow" / "10-research"
+    step.mkdir(parents=True)
+    (root / "runs").mkdir()
+    (root / "runs" / "notes.md").write_text("notes")
+    (tmp_path / "outside.txt").write_text("x")
+    rec = run_record(1, str(step), resolved_config={"version": 1, "workspace": str(root), "profile": "default",
+                                                   "toolsets": ["file"], "files": []})
+    rid = api.store.create_run(rec, max_active=4)["run_id"]
+    gen = api.claim(rid)["generation"]
+    _to_running(api, rid, gen)
+    answer = ("Done.\n<verksted-result>\nsummary: Wrote the notes.\noutputs:\n- runs/notes.md\n- ghost.md\n"
+              "- ../outside.txt\n</verksted-result>")
+    forged = {"block": "ok", "outputs": [{"path": "/etc/passwd", "relative": "x", "kind": "file"}]}
+    done = api.step(rid, gen, "finished", {"identity": IDENTITY, "outcome": "completed", "final_response": answer,
+                                           "result": forged, "outputs": ["/etc/passwd"]})
+    summary = done["run"]
+    assert summary["result_block"] == "ok" and summary["result_preview"] == "Wrote the notes."
+    assert summary["outputs"] == [{"relative": "runs/notes.md", "path": str(root / "runs" / "notes.md"),
+                                   "kind": "file"}]
+    assert summary["missing"] == [{"path": "ghost.md", "reason": "not_found"},
+                                  {"path": "../outside.txt", "reason": "outside_workspace"}]
+    ref = api.store.get_run(rid)["result_ref"]
+    assert ref["root"] == str(root) and ref["outputs"][0]["size"] == 5
+    assert set(ref["outputs"][0]) == {"path", "relative", "kind", "size", "mtime"}  # a reference, no content
+
+
+def test_a_finished_answer_without_a_block_reports_missing(api):
+    rid = api.store.create_run(run_record(), max_active=4)["run_id"]
+    gen = api.claim(rid)["generation"]
+    _to_running(api, rid, gen)
+    done = api.step(rid, gen, "finished", {"identity": IDENTITY, "outcome": "completed",
+                                           "final_response": "I wrote notes.md", "unanswered": [{"question": "A?"}],
+                                           "blocked": [{"command": "rm x", "reason": "timeout"}]})
+    assert done["run"]["result_block"] == "missing" and done["run"]["outputs"] == []
+    assert done["run"]["result_preview"] == "I wrote notes.md"
+    assert done["run"]["unanswered"] == [{"question": "A?"}]
+    assert done["run"]["blocked"] == [{"command": "rm x", "reason": "timeout"}]
+
+
+def test_summaries_carry_the_stop_request_and_the_turn(api):
+    rid = api.store.create_run(run_record(), max_active=4)["run_id"]
+    gen = api.claim(rid)["generation"]
+    running = _to_running(api, rid, gen)["run"]
+    assert running["cancel_requested"] is False and running["turn"] == 1
+    api.store.request_cancel(rid)
+    # The holder learns of the stop from the answer to its next running step.
+    again = api.step(rid, gen, "running", {"identity": IDENTITY, "receipt_status": "started"})
+    assert again["run"]["cancel_requested"] is True
+    cancelled = api.store.create_run(run_record(2, "/work/b"), max_active=4)["run_id"]
+    api.store.request_cancel(cancelled)
+    summary = {r["run_id"]: r for r in api.get("/runs")["runs"]}[cancelled]
+    assert summary["state"] == "cancelled" and summary["reason"] == "cancelled_before_submit"
+    assert cancelled not in [r["run_id"] for r in api.get("/runs/claimable")["runs"]]
+
+
+def test_a_follow_up_turn_is_claimed_in_start_mode_with_its_own_submission(api):
+    rid = api.store.create_run(run_record(), max_active=4)["run_id"]
+    gen = api.claim(rid)["generation"]
+    _to_running(api, rid, gen)
+    api.step(rid, gen, "finished", {"identity": IDENTITY, "outcome": "completed", "final_response": "one"})
+    api.store.start_send(rid, task="two", prompt_text="two + suffix", max_active=4)
+    granted = api.claim(rid, owner="win-b")
+    assert granted["mode"] == "start" and granted["run"]["state"] == "send_waiting"
+    assert granted["run"]["submission_id"] == f"{rid}.submit.2" and granted["run"]["prompt_text"] == "two + suffix"
+    assert granted["run"]["session_id"] == "s-1" and granted["run"]["turn"] == 2
+    assert granted["run"]["effective_toolsets"] is None or isinstance(granted["run"]["effective_toolsets"], list)

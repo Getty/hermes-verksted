@@ -20,10 +20,12 @@ const ticks = async (n = 5) => { for (let i = 0; i < n; i++) await new Promise(r
 test('a start runs describe, claim, then create → check → submit on one retained route', async () => {
   const env = setup()
   await worker(env).poll()
+  // k8 (P5): the retain is held while the run is followed, not released after the submit — it keeps
+  // the child attached to this window's socket as a viewer, so a Rückfrage has someone to wait for.
   assert.deepEqual(trace(env.log), [
     'rest /runs/claimable', 'runtime.describe', 'rest claim',
     'retain', 'step create_requested', 'session.create', 'step session_created', 'tools.show',
-    'step toolsets_checked', 'session.info', 'step submit_requested', 'prompt.submit', 'step running', 'release',
+    'step toolsets_checked', 'session.info', 'step submit_requested', 'prompt.submit', 'step running',
     'prompt.receipt', 'step running', 'rest /runs'
   ])
   const run = storedRun()
@@ -226,18 +228,22 @@ test('no reply after the repeats leaves the run for a later claim', async () => 
 })
 
 test('the guard refuses every call and parameter outside the allow list', () => {
-  for (const method of ['approval.respond', 'clarify.respond', 'clarify.lock', 'session.yolo', 'prompt.cancel', 'session.mutate']) {
+  for (const method of ['approval.respond', 'clarify.respond', 'clarify.lock', 'session.yolo', 'session.interrupt', 'session.mutate']) {
     assert.throws(() => guardCall(method, {}), GuardError, method)
   }
   for (const [method, params] of [
     ['session.create', { cwd: '/x', yolo: true }],
     ['session.create', { cwd: '/x', unattended: true }],
     ['prompt.submit', { session_id: 's', text: 't', submission_id: 'x', finite: true }],
-    ['prompt.submit', { session_id: 's', text: 't', submission_id: 'x', toolsets: ['web'] }]
+    ['prompt.submit', { session_id: 's', text: 't', submission_id: 'x', toolsets: ['web'] }],
+    ['prompt.cancel', { session_id: 's', admission_id: 'a', reason: 'user' }],
+    ['prompt.cancel', { session_id: 's', admission_id: 'a', input_id: 'x' }]
   ]) {
     assert.throws(() => guardCall(method, params), GuardError, `${method} ${Object.keys(params)}`)
   }
   assert.doesNotThrow(() => guardCall('session.create', storedRun().create_params))
+  // k8: a stop goes out for one admission only — never a session-wide interrupt.
+  assert.doesNotThrow(() => guardCall('prompt.cancel', { session_id: 's', admission_id: 'a' }))
 })
 
 test('a tampered stored create call never leaves the window', async () => {
@@ -306,8 +312,11 @@ test('tracking reports the terminal result', async () => {
   await w.poll()
   await w.trackAll()
   assert.deepEqual(calls(env.log, 'prompt.receipt').at(-1), { session_id: 's-1', admission_id: 'adm-1', include_result: true })
-  assert.deepEqual(lastStep(env.log), { name: 'finished', data: { identity: IDENTITY, outcome: 'completed', final_response: 'Hallo' } })
+  // k8 (P5): the finished step also carries the Rückfragen and approvals nobody answered.
+  assert.deepEqual(lastStep(env.log), { name: 'finished', data: { identity: IDENTITY, outcome: 'completed', final_response: 'Hallo',
+    unanswered: [], blocked: [] } })
   assert.equal(w.held().size, 0)
+  assert.equal(trace(env.log).filter(t => t === 'release').length, 1, 'the retain ends with the run')
 })
 
 test('an admission Hermes cannot account for becomes unknown and is not retried', async () => {
@@ -616,7 +625,7 @@ test('fix 8: reconciling an unconfirmed submit never submits into a session it c
     identity: { ...IDENTITY } })
   const resume = happyHandlers()['session.resume']
   for (const [what, snap] of [
-    ['an agent already built (lazy false)', { ...resume, info: info(['file', 'terminal'], { lazy: false }) }],
+    ['an agent already built whose set grew', { ...resume, info: info(['file', 'terminal', 'web'], { lazy: false }) }],
     ['no info', { ...resume, info: undefined }],
     ['a turn running', { ...resume, running: true }],
     ['another admission pending', { ...resume, pending: [{ admission_id: 'adm-x', input_id: 'user-typed', status: 'queued' }] }],
@@ -638,6 +647,31 @@ test('fix 8: reconciling an unconfirmed submit never submits into a session it c
   await worker(env).poll()
   assert.equal(calls(env.log, 'prompt.submit').length, 0)
   assert.equal(steps(env.log).find(s => s.name === 'running').data.admission_id, 'adm-9')
+})
+
+// Replaces the k3 claim "lazy false with nothing pending → unknown": that was the P1 cell (the
+// submit's reply was lost and the turn already finished). Hermes answers an identical prompt.submit
+// with the admission it took — an exact or terminal replay (hermes_state_runtime.py:128-162 at
+// ad2b705) — so the repeat is safe and the only way to learn the admission (card k8, P1).
+test('k8 P1: a lost submit reply after the turn finished repeats the identical submit and adopts the admission', async () => {
+  const run = storedRun({ state: 'submit_requested', session_id: 's-1', effective_toolsets: ['file', 'terminal'],
+    identity: { ...IDENTITY } })
+  const h = happyHandlers()
+  h['session.resume'] = { ...h['session.resume'], info: info(['file', 'terminal'], { lazy: false }), running: false, pending: [] }
+  h['prompt.submit'] = { admission_id: 'adm-1', status: 'terminal', outcome: 'completed' }
+  const env = setup({ run, handlers: h })
+  await worker(env).poll()
+  assert.deepEqual(calls(env.log, 'prompt.submit'), [{ session_id: 's-1', text: 'do it', submission_id: 'vk-1.submit.1' }])
+  assert.equal(steps(env.log).find(s => s.name === 'running').data.admission_id, 'adm-1')
+
+  // A session that never ran a turn admitted nothing: a failed check there is a refusal, not unknown.
+  const lazy = happyHandlers()
+  lazy['session.resume'] = { ...lazy['session.resume'], info: info(['file', 'terminal', 'web']), pending: [] }
+  const env2 = setup({ run, handlers: lazy })
+  await worker(env2).poll()
+  assert.equal(calls(env2.log, 'prompt.submit').length, 0)
+  assert.equal(lastStep(env2.log).name, 'refused')
+  assert.equal(lastStep(env2.log).data.reason, 'toolsets_exceeded')
 })
 
 // -- k5: a run in another profile -----------------------------------------------------------------
@@ -720,4 +754,261 @@ test('k5: the run view shows the resolved state', () => {
   assert.equal(configLine(storedRun()), 'Toolsets: file, terminal · Arbeitsbereich: /work/a · sha256:0123456789ab')
   assert.equal(configLine({ expected_toolsets: null, config: {} }), 'Toolsets: Profil-Standard')
   assert.equal(configLine({ expected_toolsets: [] }), 'Toolsets: keine')
+})
+
+// -- k8: cancel, send, reconnect, Rückfragen without a viewer; k10: the run view's outputs -------
+
+const { resultNotes, resultLines, isTransient, STOPPING_LABEL } = plugin
+const started = () => {
+  const h = happyHandlers()
+  h['prompt.receipt'] = { admission_id: 'adm-1', status: 'started' }
+  return h
+}
+
+test('k8: a stored stop is sent once as prompt.cancel for our own admission, then the receipt decides', async () => {
+  const handlers = started()
+  handlers['prompt.cancel'] = { admission_id: 'adm-1', status: 'started' }
+  const env = setup({ handlers })
+  const w = worker(env)
+  await w.poll()
+  assert.equal(calls(env.log, 'prompt.cancel').length, 0, 'no stop before the tool stored one')
+  env.api.state.run.cancel_requested = true // the tool's request, seen by the next step answer
+  await w.trackAll()
+  await w.trackAll()
+  assert.deepEqual(calls(env.log, 'prompt.cancel'), [{ session_id: 's-1', admission_id: 'adm-1' }])
+  assert.equal(env.api.state.run.state, 'running', 'a sent stop is not a stop: only the receipt says so')
+
+  handlers['prompt.receipt'] = { admission_id: 'adm-1', status: 'terminal', outcome: 'interrupted', result: { final_response: 'halb' } }
+  await w.trackAll()
+  assert.equal(lastStep(env.log).name, 'finished')
+  assert.equal(lastStep(env.log).data.outcome, 'interrupted')
+  assert.equal(calls(env.log, 'prompt.cancel').length, 1)
+})
+
+test('k8: the run list carries a stop to the holder at once', async () => {
+  const handlers = started()
+  handlers['prompt.cancel'] = { admission_id: 'adm-1', status: 'started' }
+  const env = setup({ handlers })
+  const w = worker(env)
+  await w.poll()
+  env.api.state.run.cancel_requested = true
+  await w.poll() // the list refresh, without waiting for the track tick
+  assert.equal(calls(env.log, 'prompt.cancel').length, 1)
+})
+
+for (const [what, err, again] of [
+  ['a draining gateway', new RpcError(4001, 'runtime_draining', { reason: 'runtime_draining' }), true],
+  ['storage busy (5001)', new RpcError(5001, 'storage_unavailable', { reason: 'storage_unavailable' }), true],
+  ['a lost reply', new TransportError('socket closed'), true],
+  ['an unknown execution', new RpcError(4001, 'unknown_execution', { reason: 'unknown_execution' }), false]
+]) {
+  test(`k8: prompt.cancel after ${what} is ${again ? '' : 'not '}asked again`, async () => {
+    const handlers = started()
+    handlers['prompt.cancel'] = [err, { admission_id: 'adm-1', status: 'started' }]
+    const env = setup({ handlers, run: storedRun({ cancel_requested: true }) })
+    const w = worker(env)
+    await w.poll()
+    await w.trackAll()
+    assert.equal(calls(env.log, 'prompt.cancel').length, again ? 2 : 1)
+    assert.equal(env.api.state.run.state, 'running')
+  })
+}
+
+test('k8: draining, storage and lost receipt replies never count toward the three refusals', async () => {
+  const draining = new RpcError(4001, 'runtime_draining', { reason: 'runtime_draining' })
+  const handlers = happyHandlers()
+  handlers['prompt.receipt'] = [draining, new RpcError(5001, 'busy'), new TransportError('t'), draining, draining,
+    new RpcError(4004, 'gone'), new RpcError(4004, 'gone'), new RpcError(4004, 'gone')]
+  const env = setup({ handlers })
+  const w = worker(env)
+  await w.poll() // 1: draining
+  for (let i = 0; i < 6; i++) await w.trackAll() // 5001, lost, draining, draining, refused, refused
+  assert.equal(env.api.state.run.state, 'running')
+  await w.trackAll() // refused (3)
+  assert.equal(lastStep(env.log).data.reason, 'receipt_refused')
+  assert.equal(isTransient(draining), true)
+  assert.equal(isTransient(new RpcError(4004, 'gone')), false)
+})
+
+test('k8: a stop stored before the submit was admitted ends cancelled without Hermes taking the turn', async () => {
+  const run = storedRun({ state: 'submit_requested', session_id: 's-1', effective_toolsets: ['file', 'terminal'],
+    identity: { ...IDENTITY }, cancel_requested: true })
+  const h = happyHandlers()
+  h['session.resume'] = { ...h['session.resume'], info: info(['file', 'terminal']), pending: [] } // lazy: never ran
+  const env = setup({ run, handlers: h })
+  await worker(env).poll()
+  assert.equal(calls(env.log, 'prompt.submit').length, 0)
+  assert.deepEqual(lastStep(env.log), { name: 'cancelled', data: { reason: 'never_admitted' } })
+
+  // An agent that ran (lazy false) may hold our turn: the identical submit learns its admission.
+  const ran = happyHandlers()
+  ran['session.resume'] = { ...ran['session.resume'], info: info(['file', 'terminal'], { lazy: false }), pending: [] }
+  ran['prompt.submit'] = { admission_id: 'adm-1', status: 'terminal', outcome: 'completed' }
+  const env2 = setup({ run, handlers: ran })
+  await worker(env2).poll()
+  assert.equal(calls(env2.log, 'prompt.submit').length, 1)
+  assert.notEqual(lastStep(env2.log).name, 'cancelled')
+})
+
+const followUp = (over = {}) => storedRun({
+  state: 'send_waiting', session_id: 's-1', effective_toolsets: ['file', 'terminal'], identity: { ...IDENTITY },
+  submission_id: 'vk-1.submit.2', prompt_text: 'und jetzt das', ...over
+})
+
+test('k8: a follow-up re-attaches its session, checks it with lazy false allowed, and submits the new id', async () => {
+  const h = happyHandlers()
+  h['session.resume'] = { ...h['session.resume'], info: info(['file', 'terminal'], { lazy: false }) }
+  h['prompt.submit'] = { admission_id: 'adm-2', status: 'queued' }
+  const env = setup({ run: followUp(), handlers: h })
+  await worker(env).poll()
+  const t = trace(env.log)
+  assert.equal(calls(env.log, 'session.create').length, 0, 'the same child session')
+  assert.deepEqual(calls(env.log, 'session.resume')[0], { session_id: 's-1', omit_messages: true })
+  assert.ok(t.indexOf('session.resume') < t.indexOf('step submit_requested'))
+  assert.deepEqual(calls(env.log, 'prompt.submit'), [{ session_id: 's-1', text: 'und jetzt das', submission_id: 'vk-1.submit.2' }])
+  assert.equal(steps(env.log).find(s => s.name === 'running').data.admission_id, 'adm-2')
+  assert.ok(!t.includes('implicit'), 'the client never resumes unseen')
+})
+
+for (const [what, change, reason] of [
+  ['a set that grew since the first turn', h => { h['session.resume'].info = info(['file', 'terminal', 'web'], { lazy: false }) }, 'toolsets_exceeded'],
+  ['another protocol', h => { h['session.resume'].info = { ...info(['file', 'terminal'], { lazy: false }), desktop_protocol: 'tui-v6' } }, 'toolsets_not_checkable']
+]) {
+  test(`k8: a follow-up into ${what} is refused before any prompt`, async () => {
+    const h = happyHandlers()
+    h['session.resume'] = { ...h['session.resume'] }
+    change(h)
+    const env = setup({ run: followUp(), handlers: h })
+    await worker(env).poll()
+    assert.equal(calls(env.log, 'prompt.submit').length, 0)
+    assert.equal(lastStep(env.log).name, 'refused')
+    assert.equal(lastStep(env.log).data.reason, reason)
+  })
+}
+
+test('k8: a follow-up goes out only under the identity the child was created with', async () => {
+  const env = setup({ run: followUp({ identity: { ...IDENTITY, connection_id: 'remote-1' } }) })
+  await worker(env).poll()
+  assert.ok(!trace(env.log).includes('rest claim'), 'a child of another connection is left to it')
+
+  const env2 = setup({ run: followUp({ identity: { ...IDENTITY, subject: 'alice' } }), subject: 'bob' })
+  await worker(env2).poll()
+  assert.equal(calls(env2.log, 'prompt.submit').length, 0)
+  assert.deepEqual(lastStep(env2.log).name, 'refused')
+  assert.equal(lastStep(env2.log).data.reason, 'identity_changed')
+
+  const env3 = setup({ run: followUp({ identity: { ...IDENTITY, subject: 'alice' } }), subject: 'alice' })
+  await worker(env3).poll()
+  assert.equal(calls(env3.log, 'prompt.submit').length, 1)
+})
+
+// Regression (found in k8): the pre-claim connection check compared the stored principal against
+// none, so a child created under a non-null subject was never claimed again by any window.
+test('k8: a running child stored under a principal is reconciled by a window of its connection', async () => {
+  const run = storedRun({ state: 'running', session_id: 's-1', admission_id: 'adm-1', identity: { ...IDENTITY, subject: 'alice' } })
+  const env = setup({ run, subject: 'alice', handlers: started() })
+  const w = worker(env)
+  await w.poll()
+  assert.ok(trace(env.log).includes('rest claim'))
+  assert.equal(calls(env.log, 'prompt.receipt').length, 1)
+  assert.equal(w.held().size, 1)
+})
+
+test('k8 P5: the retain holds while the run is followed and ends with it, a lost claim or dispose', async () => {
+  const releases = env => trace(env.log).filter(t => t === 'release').length
+  const env = setup({ handlers: started() })
+  const w = worker(env)
+  await w.poll()
+  await w.trackAll()
+  assert.equal(releases(env), 0, 'held while the child runs')
+
+  env.api.state.generation += 1 // another window took over
+  await w.renewAll()
+  assert.equal(releases(env), 1)
+  assert.equal(w.held().size, 0)
+
+  const env2 = setup({ handlers: started() })
+  const w2 = worker(env2)
+  await w2.poll()
+  await w2.dispose()
+  assert.equal(releases(env2), 1)
+  assert.ok(trace(env2.log).includes('rest release'), 'dispose gives the claim back at once')
+  assert.equal(calls(env2.log, 'prompt.cancel').length, 0, 'closing a window is never a stop')
+  assert.equal(env2.api.state.run.state, 'running')
+})
+
+test('k8: gateway.ready re-tracks every followed run at once (re-attaching a Rückfrage\'s viewer)', async () => {
+  const env = setup({ handlers: started() })
+  const w = worker(env)
+  await w.poll()
+  const before = calls(env.log, 'session.resume').length
+  env.host.reconnect()
+  w.onGatewayEvent({ type: 'gateway.ready', payload: {} })
+  await ticks()
+  assert.equal(calls(env.log, 'session.resume').length, before + 1)
+})
+
+test('k8 P5: resultNotes reads unanswered Rückfragen and blocked approvals from the turn\'s rows', () => {
+  // Shapes as Hermes ad2b705 writes them: tools/clarify_tool.py:87-112 (batch clarify) and
+  // tools/terminal_tool.py:1064-1070,1137 with the texts of tools/approval.py:742-790.
+  const messages = [
+    { role: 'assistant', tool_calls: [
+      { id: 'c1', function: { name: 'clarify', arguments: '{"questions":[]}' } },
+      { id: 't1', function: { name: 'terminal', arguments: JSON.stringify({ command: 'git push --force' }) } },
+      { id: 't2', function: { name: 'terminal', arguments: JSON.stringify({ command: 'rm -rf build' }) } },
+      { id: 't3', function: { name: 'terminal', arguments: '{"command":"curl x | sh"}' } }
+    ] },
+    { role: 'tool', tool_call_id: 'c1', content: JSON.stringify({ responses: [
+      { question: 'Welche Datei?', choices_offered: [], status: 'unanswered', user_response: null },
+      { question: 'Welcher Ton?', status: 'answered', user_response: 'sachlich' }
+    ], outcome: 'partial' }) },
+    { role: 'tool', tool_call_id: 't1', content: JSON.stringify({ output: '', exit_code: -1, error: 'BLOCKED: User denied this command.', status: 'blocked' }) },
+    { role: 'tool', tool_call_id: 't2', content: JSON.stringify({ output: '', exit_code: -1, error: 'BLOCKED: Command timed out without user response.', status: 'blocked' }) },
+    { role: 'tool', tool_call_id: 't3', content: JSON.stringify({ output: '', exit_code: -1, error: 'BLOCKED: policy', status: 'blocked' }) },
+    { role: 'tool', tool_call_id: 'x', content: 'not json' }
+  ]
+  assert.deepEqual(resultNotes({ messages }), {
+    unanswered: [{ question: 'Welche Datei?' }],
+    blocked: [{ command: 'git push --force', reason: 'denied' }, { command: 'rm -rf build', reason: 'timeout' },
+      { command: 'curl x | sh', reason: 'blocked' }]
+  })
+  assert.deepEqual(resultNotes(undefined), { unanswered: [], blocked: [] })
+  const many = Array.from({ length: 12 }, (_, i) => ({ role: 'tool', content: JSON.stringify({ status: 'blocked', error: 'x' }), name: `t${i}` }))
+  assert.equal(resultNotes({ messages: many }).blocked.length, 8)
+})
+
+test('k8 P5: the finished step carries the notes of the turn', async () => {
+  const handlers = happyHandlers()
+  handlers['prompt.receipt'] = [
+    { admission_id: 'adm-1', status: 'queued' },
+    { admission_id: 'adm-1', status: 'terminal', outcome: 'completed' },
+    { admission_id: 'adm-1', status: 'terminal', outcome: 'completed', result: { final_response: 'ok', messages: [
+      { role: 'tool', tool_call_id: 'c', content: JSON.stringify({ responses: [{ question: 'Q?', status: 'unanswered' }] }) }
+    ] } }
+  ]
+  const env = setup({ handlers })
+  const w = worker(env)
+  await w.poll()
+  await w.trackAll()
+  assert.deepEqual(lastStep(env.log).data.unanswered, [{ question: 'Q?' }])
+  assert.ok(!Object.hasOwn(lastStep(env.log).data, 'outputs'), 'outputs come from the plugin API\'s check, never from the window')
+})
+
+test('k8/k10: labels show a pending stop and the run view lists checked outputs', () => {
+  const now = 1000 * 1000
+  const live = { expires_at: 2000 }
+  assert.equal(labelOf({ state: 'running', prompts: [], claim: live, cancel_requested: true }, now).text, STOPPING_LABEL)
+  assert.equal(labelOf({ state: 'running', prompts: [{ kind: 'clarify' }], claim: live, cancel_requested: true }, now).text, 'Rückfrage')
+  assert.equal(labelOf({ state: 'cancelled', claim: {}, cancel_requested: true }, now).text, 'abgebrochen')
+  assert.equal(labelOf({ state: 'send_waiting', claim: {} }, now).stale, false)
+
+  assert.deepEqual(resultLines({ state: 'running', outputs: [{ relative: 'a' }] }), [])
+  assert.deepEqual(resultLines({
+    state: 'finished', result_block: 'ok',
+    outputs: [{ relative: 'runs/r1/notes.md', kind: 'file' }, { relative: 'runs/r1', kind: 'folder' }],
+    missing: [{ path: 'ghost.md', reason: 'not_found' }, { path: '../x', reason: 'outside_workspace' }],
+    unanswered: [{ question: 'Welche Datei?' }], blocked: [{ command: 'git push' }]
+  }), ['→ runs/r1/notes.md', '→ runs/r1/', '✗ ghost.md (not_found)', '✗ ../x (outside_workspace)',
+    'Rückfrage ohne Antwort: Welche Datei?', 'Nicht freigegeben: git push'])
+  assert.equal(resultLines({ state: 'finished', result_block: 'missing' }).length, 1)
 })

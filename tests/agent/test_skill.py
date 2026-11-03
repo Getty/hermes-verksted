@@ -20,7 +20,7 @@ import pytest
 from ruamel.yaml import YAML
 
 from conftest import HERMES_SRC, PACKAGE, REPO, VENV_PYTHON, make_throwaway_home
-from verksted import store, tool
+from verksted import result, store, tool
 
 SKILL = PACKAGE / "skills" / "verksted" / "SKILL.md"
 DEMO = REPO / "examples" / "verksted-demo"
@@ -112,7 +112,7 @@ def test_body_has_no_hermes_preprocessing_syntax():
 def test_examples_use_only_implemented_actions_and_real_arguments():
     examples = _examples()
     props = tool.SCHEMA["parameters"]["properties"]
-    implemented = set(tool.ACTIONS) - set(tool.NOT_YET)
+    implemented = set(tool.ACTIONS)
     calls = _verksted_args(examples)
     assert {c["action"] for c in calls} == implemented  # every implemented action is shown once at least
     for args in calls:
@@ -122,6 +122,8 @@ def test_examples_use_only_implemented_actions_and_real_arguments():
             assert {"folder", "task"} <= set(args)
         else:
             assert "handle" in args
+        if args["action"] == "send":
+            assert "task" in args and "folder" not in args  # a follow-up keeps the run's folder
         if "wait_seconds" in args:
             assert 0 <= args["wait_seconds"] <= props["wait_seconds"]["maximum"]
     assert examples["tool_search"] and examples["tool_call"]
@@ -135,15 +137,34 @@ def test_examples_use_only_implemented_actions_and_real_arguments():
 def _result_views() -> list[dict]:
     base = {"run_id": "vk-x", "target_dir": "/w", "parent_profile": "default", "claim_expires_at": 0}
     detail = {"reason": "r", "detail": "d", "missing": [], "extra": [], "enabled_toolsets": [], "field": "f"}
+    checked = {"v": 2, "final_response": "r", "block": "ok", "summary": "s", "result_truncated": False,
+               "outputs": [{"path": "/w/a.md", "relative": "a.md", "kind": "file", "size": 1, "mtime": 1.0}],
+               "missing": [{"path": "b.md", "reason": "not_found"}],
+               "unanswered": [{"question": "q"}], "blocked": [{"command": "c", "reason": "denied"}]}
     runs = [
-        {**base, "state": "finished", "outcome": "completed", "result_ref": {"final_response": "r"}},
+        {**base, "state": "finished", "outcome": "completed", "result_ref": checked},
+        {**base, "state": "finished", "outcome": "interrupted", "result_ref": {"final_response": "r"}},  # schema 1
         {**base, "state": "refused", "state_detail": detail},
         {**base, "state": "unknown", "state_detail": detail},
+        {**base, "state": "cancelled", "state_detail": {"reason": "cancelled_before_submit"}},
         {**base, "state": "running", "claim_expires_at": 1e12,
          "state_detail": {"prompts": [{"kind": "clarify", "prompt_id": "p"}]}},
+        {**base, "state": "running", "claim_expires_at": 1e12, "cancel_requested_at": 1.0},
         {**base, "state": "waiting_for_gui"},
+        {**base, "state": "send_waiting", "turn_no": 2},
     ]
     return [tool._view(run, 1.0, wait_end=end) for run in runs for end in (None, "timeout")]
+
+
+def _cancel_verdicts() -> set[str]:
+    """Every value of the `cancel` field that action=cancel adds to the view."""
+    return {tool._cancel_verdict({"state": state, "outcome": outcome})
+            for state in store.STATES for outcome in ("completed", *tool.STOPPED_OUTCOMES)}
+
+
+def _result_blocks() -> set[str]:
+    return {result.parse(text)["block"] for text in
+            ("none", "<verksted-result>\nsummary: s\noutputs: none\n</verksted-result>", "<verksted-result>")}
 
 
 def _error_codes() -> set[str]:
@@ -156,16 +177,18 @@ def test_field_references_exist_in_the_tool_result():
     a value the tool can return."""
     _, body = _skill_parts()
     views = _result_views()
-    keys = {k for v in views for k in v} | {"error.code", "error.message", "error.handle"}
+    keys = {k for v in views for k in v} | {"error.code", "error.message", "error.handle", "cancel"}
     args = set(tool.SCHEMA["parameters"]["properties"])
     bridge_args = {"queries", "limit", "names", "calls"}  # tools/tool_search.py bridge_tool_schemas
     values = {
         "state": set(store.STATES),
         "waiting_for": set(tool.WAITING_LABELS),
-        "label": set(tool.LABELS.values()) | set(tool.WAITING_LABELS.values()),
+        "label": set(tool.LABELS.values()) | set(tool.WAITING_LABELS.values()) | {tool.STOPPING_LABEL},
         "wait_end": set(re.findall(r'return run, "(\w+)"', Path(tool.__file__).read_text(encoding="utf-8"))),
         "error.code": _error_codes(),
-        "action": set(tool.ACTIONS) - set(tool.NOT_YET),
+        "action": set(tool.ACTIONS),
+        "cancel": _cancel_verdicts(),
+        "result_block": _result_blocks(),
     }
     refs = re.findall(r'`([\w.]+): ([^`]+)`', body)
     assert refs, "the skill names no result fields"
@@ -185,6 +208,32 @@ def test_every_tool_state_and_waiting_kind_is_handled():
     for kind, label in tool.WAITING_LABELS.items():
         assert f'`waiting_for: "{kind}"`' in body and f'`label: "{label}"`' in body
     assert "`stale: true`" in body and "`ok: false`" in body
+    assert "`cancel_requested: true`" in body and f'`label: "{tool.STOPPING_LABEL}"`' in body
+
+
+def test_every_cancel_verdict_and_result_block_is_handled():
+    _, body = _skill_parts()
+    for verdict in _cancel_verdicts():
+        assert f'`cancel: "{verdict}"`' in body, f"the skill does not say what cancel: {verdict} means"
+    for block in _result_blocks() - {"ok"}:
+        assert f'`result_block: "{block}"`' in body, block
+    for field in ("summary", "outputs", "missing", "unanswered", "blocked"):
+        assert f"`{field}`" in body, field
+        assert any(field in v for v in _result_views()), f"{field} is not in a finished view"
+
+
+def test_the_send_refusals_are_handled():
+    _, body = _skill_parts()
+    for code in ("run_active", "not_sendable", "outcome_unknown"):
+        assert code in _error_codes() and f'`error.code: "{code}"`' in body, code
+
+
+def test_the_task_template_leaves_the_summary_to_the_result_block():
+    # k10: Verksted appends the result-block request; the skill's own "list every file you wrote"
+    # line would ask the child for a second, unchecked list.
+    _, body = _skill_parts()
+    assert "lists every file you wrote" not in body
+    assert "topmost folder" in body  # k5: the workspace root is the topmost one, as config.py resolves it
 
 
 def test_the_skill_names_the_desktop_button_as_the_desktop_part_labels_it():

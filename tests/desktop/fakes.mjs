@@ -120,7 +120,7 @@ export function makeHost({ routes = [ROUTE], handlers = happyHandlers(), log = [
   }
 }
 
-const FINAL = ['finished', 'refused', 'unknown']
+const FINAL = ['finished', 'refused', 'unknown', 'cancelled']
 
 /** The plugin API as the Desktop part sees it through ctx.rest: one run, claims and steps.
  *  `subject`: the principal subject the host authenticates this window's requests as. */
@@ -142,7 +142,7 @@ export function makeApi(run, { log = [], refuse = {}, mode, subject = null } = {
       state.generation += 1
       state.run.claim = { owner: body.owner, generation: state.generation, live: true }
       return { ok: true, generation: state.generation, expires_at: 9e9, subject,
-        mode: mode || (state.run.state === 'waiting_for_gui' ? 'start' : 'reconcile'), run: structuredClone(state.run) }
+        mode: mode || (['waiting_for_gui', 'send_waiting'].includes(state.run.state) ? 'start' : 'reconcile'), run: structuredClone(state.run) }
     }
     if (body.generation !== state.generation) return { ok: false, code: 'stale_generation' }
     if (action === 'renew') return { ok: true, generation: state.generation, expires_at: 9e9 }
@@ -160,7 +160,7 @@ export function makeApi(run, { log = [], refuse = {}, mode, subject = null } = {
       if (data.admission_id) r.admission_id = data.admission_id
       if (Array.isArray(data.enabled_toolsets)) r.effective_toolsets = data.enabled_toolsets
       if (body.step === 'running') r.prompts = data.prompts || []
-      if (['refused', 'unknown'].includes(body.step)) Object.assign(r, { reason: data.reason, detail: data.detail })
+      if (['refused', 'unknown', 'cancelled'].includes(body.step)) Object.assign(r, { reason: data.reason, detail: data.detail })
       if (body.step === 'finished') Object.assign(r, { outcome: data.outcome, result_preview: data.final_response })
       return { ok: true, run: structuredClone(r) }
     }

@@ -315,3 +315,225 @@ def test_opening_a_current_store_writes_nothing(tmp_path):
 
     assert Store(connect).list_runs() == []
     assert not [s for s in seen if s.lstrip().upper().startswith(("BEGIN", "CREATE", "INSERT"))], seen
+
+
+# -- schema 2 (cards k8, k10) ---------------------------------------------------------------
+
+FIXTURES = __import__("pathlib").Path(__file__).parent / "fixtures"
+
+
+def _v1_store(tmp_path, clock):
+    """A schema-1 file built by the committed schema-1 code (fixtures/make_store_v1.py)."""
+    path = tmp_path / "v1.db"
+    conn = sqlite3.connect(path)
+    conn.executescript((FIXTURES / "store_v1.sql").read_text())
+    conn.close()
+    return path, Store.at_path(path, clock=clock)
+
+
+def test_a_schema_1_store_is_migrated_in_place(tmp_path, clock):
+    path, store = _v1_store(tmp_path, clock)
+    runs = {r["run_id"]: r for r in store.list_runs()}
+    assert {k: r["state"] for k, r in runs.items()} == {
+        "vk-0001": "finished", "vk-0002": "running", "vk-0003": "waiting_for_gui"}
+    assert all(r["turn_no"] == 1 and r["cancel_requested_at"] is None for r in runs.values())
+    assert runs["vk-0001"]["result_ref"]["final_response"].startswith("Done.")
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "2"
+    index_sql = conn.execute("SELECT sql FROM sqlite_master WHERE name='runs_one_active_per_folder'").fetchone()[0]
+    assert "send_waiting" in index_sql
+    assert conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0] == 0
+    conn.close()
+    # The migrated store works: the running run keeps its claim fencing, the folder lock still holds.
+    with pytest.raises(StoreError) as err:
+        store.create_run(run_record(9, folder="/work/busy"), max_active=8)
+    assert err.value.code == "folder_busy" and err.value.extra["run_id"] == "vk-0002"
+    assert store.start_send("vk-0001", task="more", prompt_text="more", max_active=8)["state"] == "send_waiting"
+
+
+def test_a_failed_migration_leaves_the_schema_1_store_untouched(tmp_path, clock, monkeypatch):
+    path, _ = _v1_store(tmp_path, clock)
+    import verksted.store as vstore
+    monkeypatch.setattr(vstore, "_MIGRATE_1_TO_2", vstore._MIGRATE_1_TO_2[:2] + ("THIS IS NOT SQL",))
+    with pytest.raises(sqlite3.OperationalError):
+        Store.at_path(path, clock=clock).list_runs()
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "1"
+    assert "turn_no" not in [r[1] for r in conn.execute("PRAGMA table_info(runs)")]
+    conn.close()
+
+
+def _waiting(store, n=1, folder="/work/a"):
+    store.create_run(run_record(n, folder=folder), max_active=8)
+    return f"vk-{n:04d}"
+
+
+@pytest.mark.parametrize("upto", ["waiting_for_gui", "create_requested", "session_created", "toolsets_checked"])
+def test_a_stop_before_the_submit_cancels_at_once_and_locks_the_desktop_out(store, upto):
+    rid = _waiting(store)
+    claim = store.claim(rid, "w1", principal=PRINCIPAL, lease_s=60)
+    g = claim["generation"]
+    steps = [("create_requested", {"identity": IDENTITY}),
+             ("session_created", {"identity": IDENTITY, "session_id": "child-1"}),
+             ("toolsets_checked", {"identity": IDENTITY, "enabled_toolsets": ["file"]})]
+    for name, data in steps[:["waiting_for_gui", "create_requested", "session_created", "toolsets_checked"].index(upto)]:
+        store.record_step(rid, "w1", g, name, data, principal=PRINCIPAL)
+    answer = store.request_cancel(rid)
+    assert answer["cancel"] == "not_started" and answer["run"]["state"] == "cancelled"
+    assert answer["run"]["state_detail"] == {"reason": "cancelled_before_submit", "after": upto}
+    nxt = {"waiting_for_gui": "create_requested", "create_requested": "session_created",
+           "session_created": "toolsets_checked", "toolsets_checked": "submit_requested"}[upto]
+    with pytest.raises(StoreError) as err:
+        store.record_step(rid, "w1", g, nxt, {"identity": IDENTITY, "session_id": "child-1"}, principal=PRINCIPAL)
+    assert err.value.code == "bad_transition"
+    # The folder is free again.
+    assert store.create_run(run_record(2), max_active=8)["state"] == "waiting_for_gui"
+
+
+def test_a_stop_after_the_submit_is_only_a_request_until_hermes_ends_the_turn(store):
+    rid = _waiting(store)
+    claim = store.claim(rid, "w1", principal=PRINCIPAL, lease_s=60)
+    _to_running(store, claim)
+    answer = store.request_cancel(rid)
+    assert answer["cancel"] == "requested" and answer["run"]["state"] == "running"
+    first = answer["run"]["cancel_requested_at"]
+    assert first is not None
+    assert store.request_cancel(rid)["run"]["cancel_requested_at"] == first  # idempotent
+    # Hermes' terminal receipt ends it; the outcome says whether the stop was in time.
+    done = store.record_step(rid, "w1", claim["generation"], "finished",
+                             {"identity": IDENTITY, "outcome": "interrupted", "final_response": "stopped"},
+                             principal=PRINCIPAL)
+    assert done["state"] == "finished" and done["outcome"] == "interrupted"
+    assert store.request_cancel(rid)["cancel"] == "already_final"
+
+
+def test_only_a_requested_stop_lets_the_desktop_record_cancelled(store):
+    rid = _waiting(store)
+    claim = store.claim(rid, "w1", principal=PRINCIPAL, lease_s=60)
+    g = claim["generation"]
+    for name, data in [("create_requested", {"identity": IDENTITY}),
+                       ("session_created", {"identity": IDENTITY, "session_id": "child-1"}),
+                       ("toolsets_checked", {"identity": IDENTITY}),
+                       ("submit_requested", {"identity": IDENTITY})]:
+        store.record_step(rid, "w1", g, name, data, principal=PRINCIPAL)
+    with pytest.raises(StoreError) as err:
+        store.record_step(rid, "w1", g, "cancelled", {"reason": "never_admitted"})
+    assert err.value.code == "bad_transition"
+    store.request_cancel(rid)
+    run = store.record_step(rid, "w1", g, "cancelled", {"reason": "never_admitted"})
+    assert run["state"] == "cancelled" and run["state_detail"]["reason"] == "never_admitted"
+
+
+def _finished(store, claim, *, outcome="completed", text="done", **extra):
+    _to_running(store, claim)
+    return store.record_step("vk-0001", "w1", claim["generation"], "finished",
+                             {"identity": IDENTITY, "outcome": outcome, "final_response": text, **extra},
+                             principal=PRINCIPAL)
+
+
+def test_send_continues_a_finished_run_in_its_session_and_archives_the_turn(store):
+    rid = _waiting(store)
+    claim = store.claim(rid, "w1", principal=PRINCIPAL, lease_s=60)
+    _finished(store, claim, text="first answer")
+    store.release(rid, "w1", claim["generation"])
+    run = store.start_send(rid, task="and now B", prompt_text="and now B\n<suffix>", max_active=8)
+    assert run["state"] == "send_waiting" and run["turn_no"] == 2
+    assert run["submission_id"] == "vk-0001.submit.2" and run["prompt_text"] == "and now B\n<suffix>"
+    assert run["session_id"] == "child-1" and run["request_id"] == "vk-0001.create"
+    assert run["admission_id"] is None and run["result_ref"] is None and run["outcome"] is None
+    assert run["connection_id"] == "local" and run["subject"] == "user-1"  # identity frozen from turn 1
+    [turn] = store.turns(rid)
+    assert turn["turn"] == 1 and turn["submission_id"] == "vk-0001.submit.1" and turn["state"] == "finished"
+    assert turn["result_ref"]["final_response"] == "first answer" and turn["admission_id"] == "adm-1"
+    # The follow-up holds the folder and is claimed in start mode.
+    with pytest.raises(StoreError) as err:
+        store.create_run(run_record(2), max_active=8)
+    assert err.value.code == "folder_busy"
+    again = store.claim(rid, "w2", principal=PRINCIPAL, lease_s=60)
+    assert again["mode"] == "start" and again["generation"] == claim["generation"] + 1
+    g = again["generation"]
+    with pytest.raises(StoreError) as err:
+        store.record_step(rid, "w2", g, "submit_requested", {"identity": dict(IDENTITY, connection_id="other")},
+                          principal=PRINCIPAL)
+    assert err.value.code == "identity_mismatch"
+    store.record_step(rid, "w2", g, "submit_requested", {"identity": IDENTITY}, principal=PRINCIPAL)
+    run = store.record_step(rid, "w2", g, "running", {"identity": IDENTITY, "admission_id": "adm-2"},
+                            principal=PRINCIPAL)
+    assert run["admission_id"] == "adm-2"
+
+
+@pytest.mark.parametrize("final,code", [("running", "run_active"), ("unknown", "outcome_unknown"),
+                                        ("refused", "not_sendable"), ("cancelled_early", "not_sendable")])
+def test_send_is_refused_unless_the_last_turn_ended_in_a_known_session(store, final, code):
+    rid = _waiting(store)
+    claim = store.claim(rid, "w1", principal=PRINCIPAL, lease_s=60)
+    g = claim["generation"]
+    if final == "running":
+        _to_running(store, claim)
+    elif final == "unknown":
+        _to_running(store, claim)
+        store.record_step(rid, "w1", g, "unknown", {"reason": "admission_unknown"})
+    elif final == "refused":
+        store.record_step(rid, "w1", g, "refused", {"reason": "legacy_route"})
+    else:
+        store.request_cancel(rid)  # before any session existed
+    with pytest.raises(StoreError) as err:
+        store.start_send(rid, task="t", prompt_text="t", max_active=8)
+    assert err.value.code == code
+    assert store.turns(rid) == []
+
+
+def test_a_follow_up_stopped_before_its_submit_can_be_sent_again(store):
+    rid = _waiting(store)
+    claim = store.claim(rid, "w1", principal=PRINCIPAL, lease_s=60)
+    _finished(store, claim)
+    store.start_send(rid, task="t2", prompt_text="t2", max_active=8)
+    assert store.request_cancel(rid)["cancel"] == "not_started"
+    run = store.start_send(rid, task="t3", prompt_text="t3", max_active=8)
+    assert run["turn_no"] == 3 and run["submission_id"] == "vk-0001.submit.3"
+    assert [t["state"] for t in store.turns(rid)] == ["finished", "cancelled"]
+
+
+def test_send_respects_the_folder_lock_and_the_active_limit(store):
+    rid = _waiting(store)
+    claim = store.claim(rid, "w1", principal=PRINCIPAL, lease_s=60)
+    _finished(store, claim)
+    store.create_run(run_record(2, folder="/work/a"), max_active=8)
+    with pytest.raises(StoreError) as err:
+        store.start_send(rid, task="t", prompt_text="t", max_active=8)
+    assert err.value.code == "folder_busy" and err.value.extra["run_id"] == "vk-0002"
+    claim2 = store.claim("vk-0002", "w1", principal=PRINCIPAL, lease_s=60)
+    store.record_step("vk-0002", "w1", claim2["generation"], "refused", {"reason": "x"})
+    store.create_run(run_record(3, folder="/work/other"), max_active=8)
+    with pytest.raises(StoreError) as err:
+        store.start_send(rid, task="t", prompt_text="t", max_active=1)
+    assert err.value.code == "too_many_runs"
+    assert store.start_send(rid, task="t", prompt_text="t", max_active=2)["state"] == "send_waiting"
+
+
+def test_finished_stores_the_checked_result_reference_not_file_contents(store):
+    rid = _waiting(store)
+    claim = store.claim(rid, "w1", principal=PRINCIPAL, lease_s=60)
+    check = {"block": "ok", "summary": "s" * 3000, "root": "/work",
+             "outputs": [{"path": f"/work/f{i}", "relative": f"f{i}", "kind": "file", "size": 3, "mtime": 1.5,
+                          "content": "never stored"} for i in range(60)],
+             "missing": [{"path": "/etc/x", "reason": "outside_workspace"}], "truncated": False}
+    done = _finished(store, claim, result=check,
+                     unanswered=[{"question": "Which one?"}] * 10,
+                     blocked=[{"command": "rm -rf x", "reason": "timeout"}])
+    ref = done["result_ref"]
+    assert ref["v"] == 2 and ref["block"] == "ok" and ref["root"] == "/work" and ref["checked_at"] == 1000.0
+    assert len(ref["summary"]) == 2000 and ref["result_truncated"] is True
+    assert len(ref["outputs"]) == 50 and "content" not in ref["outputs"][0]
+    assert ref["outputs"][0] == {"path": "/work/f0", "relative": "f0", "kind": "file", "size": 3, "mtime": 1.5}
+    assert ref["missing"] == [{"path": "/etc/x", "reason": "outside_workspace"}]
+    assert len(ref["unanswered"]) == 8 and ref["blocked"] == [{"command": "rm -rf x", "reason": "timeout"}]
+    assert ref["final_response"] == "done"
+
+
+def test_finished_without_a_check_is_reported_missing_never_invented(store):
+    rid = _waiting(store)
+    claim = store.claim(rid, "w1", principal=PRINCIPAL, lease_s=60)
+    ref = _finished(store, claim, outputs=[{"path": "/etc/passwd"}])["result_ref"]
+    assert ref["block"] == "missing" and ref["outputs"] == [] and ref["summary"] is None
+    assert ref["block_detail"] == "no result check was recorded"

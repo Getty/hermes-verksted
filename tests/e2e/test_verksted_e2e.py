@@ -8,6 +8,8 @@ Time is driven by `pump()`, which fires the Desktop part's interval callbacks (m
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sqlite3
 import time
 from pathlib import Path
@@ -20,9 +22,9 @@ from vk_e2e.flows import create_session, submit, wait_terminal
 from vk_e2e.model import Call, Clarify, Final, Terminal, WriteFile
 
 PLUGINS = {"verksted": REPO / "verksted", "e2eprobe": FIXTURES / "e2eprobe"}
-FORBIDDEN = {"approval.respond", "clarify.respond", "clarify.lock", "prompt.cancel", "session.interrupt"}
+FORBIDDEN = {"approval.respond", "clarify.respond", "clarify.lock", "session.interrupt", "prompt.resolve_unknown"}
 ALLOWED = {"runtime.describe", "session.create", "session.info", "session.resume", "tools.show", "prompt.submit",
-           "prompt.receipt"}
+           "prompt.receipt", "prompt.cancel"}
 
 
 @pytest.fixture
@@ -97,10 +99,18 @@ def sent_methods(win):
     return [c["method"] for c in win.rpc_calls()]
 
 
-def assert_never_answers(win):
+def assert_never_answers(win, env=None):
     methods = set(sent_methods(win))
     assert not methods & FORBIDDEN, f"the Desktop part sent {methods & FORBIDDEN}"
     assert methods <= ALLOWED | {"client.capabilities"}, methods - ALLOWED
+    # k8: a stop goes out for one admission, and only for a run whose stop the tool stored.
+    for call in win.rpc_calls("prompt.cancel"):
+        assert set(call["params_in"]) == {"session_id", "admission_id"}, call["params_in"]
+        if env is not None:
+            rows = store_rows(env, "SELECT cancel_requested_at FROM runs WHERE admission_id=? UNION ALL "
+                                   "SELECT cancel_requested_at FROM turns WHERE admission_id=?",
+                              call["params_in"]["admission_id"], call["params_in"]["admission_id"])
+            assert rows and all(r["cancel_requested_at"] for r in rows), (call, rows)
 
 
 # 1 ------------------------------------------------------------------------------------------------------
@@ -431,3 +441,198 @@ def test_11_a_step_folder_inherits_the_workspace_list_and_cannot_widen_it(env):
     refused = tool_result(_terminal(win, psid2, adm2))
     assert refused["ok"] is False and refused["error"]["code"] == "toolsets_widen", refused
     assert not store_rows(env, "SELECT run_id FROM runs WHERE target_dir=?", str(wide))
+
+
+# k8 / k10 -----------------------------------------------------------------------------------------------
+def _parent_call(env, win, psid, tag, args, sub, timeout=150):
+    """One more turn of the same parent session: the parent model calls verksted with ``args``."""
+    env.model.when(tag, Call("verksted", args), Final(lambda c: "RESULT:" + c.last_tool))
+    adm = submit(win, psid, f"{tag} go", sub)
+    return tool_result(pump(win, lambda: (r := win.request_profile("prompt.receipt", session_id=psid, admission_id=adm["admission_id"],
+                                                                 include_result=True))["status"] == "terminal" and r,
+                            timeout=timeout, what=f"parent turn {tag}"))
+
+
+def _child_calls(win, method, handle):
+    return [c for c in win.rpc_calls(method) if str(c["params_in"].get("submission_id", "")).startswith(handle)]
+
+
+def _running(env, folder):
+    return lambda: (store_rows(env, "SELECT run_id, session_id, admission_id FROM runs WHERE target_dir=? AND state='running'",
+                               str(folder)) or [None])[0]
+
+
+def test_12_cancel_of_a_running_turn_is_confirmed_by_the_receipt(env):
+    """verksted cancel → the stop is stored → the holding window sends prompt.cancel for the run's own
+    admission → the run counts as stopped only when the terminal receipt says interrupted."""
+    win = env.window("verksted")
+    folder = folder_for(env, "cancel")
+    env.model.when("CHILD_CANCEL", Final("must not be the answer", gate="cancel"))
+    parent_run(env, "CANCEL", folder, "CHILD_CANCEL answer", wait=0)
+    psid, adm = parent_turn(env, win, "PARENT_CANCEL go", "cancel")
+    handle = tool_result(_terminal(win, psid, adm))["handle"]
+    run = pump(win, _running(env, folder), what="child running")
+    assert env.model.gate_hit("cancel")
+    assert not win.rpc_calls("prompt.cancel"), "no stop before the tool stored one"
+
+    env.model.when("CANCEL_IT", Call("verksted", {"action": "cancel", "handle": handle, "wait_seconds": 120}),
+                   Final(lambda c: "RESULT:" + c.last_tool))
+    a2 = submit(win, psid, "CANCEL_IT go", "sub-cancel2")
+    pump(win, lambda: win.rpc_calls("prompt.cancel"), what="prompt.cancel sent")
+    env.model.release("cancel")  # the scripted model answers late; Hermes must not take it as the result
+    out = tool_result(pump(win, lambda: (r := win.request_profile("prompt.receipt", session_id=psid, admission_id=a2["admission_id"],
+                                                                 include_result=True))["status"] == "terminal" and r,
+                           what="cancel call returned"))
+    assert out["state"] == "finished" and out["outcome"] == "interrupted" and out["cancel"] == "confirmed", out
+    assert "must not be the answer" not in (out.get("result") or "")
+    cancels = win.rpc_calls("prompt.cancel")
+    assert [c["params_in"] for c in cancels] == [{"session_id": run["session_id"], "admission_id": run["admission_id"]}]
+    assert store_rows(env, "SELECT cancel_requested_at FROM runs WHERE run_id=?", handle)[0]["cancel_requested_at"]
+    assert_never_answers(win, env)
+
+
+def test_13_send_runs_a_follow_up_turn_in_the_same_child_session(env):
+    win = env.window("verksted")
+    folder = folder_for(env, "send")
+    env.model.when("CHILD_FIRST", Final("first turn done"))
+    env.model.when("CHILD_SECOND", WriteFile(str(folder / "second.txt"), "zwei"),
+                   Final("second turn done\n<verksted-result>\nsummary: Wrote second.txt.\noutputs:\n- second.txt\n</verksted-result>"))
+    parent_run(env, "SEND1", folder, "CHILD_FIRST answer")
+    psid, adm = parent_turn(env, win, "PARENT_SEND1 go", "send1")
+    first = tool_result(_terminal(win, psid, adm))
+    assert first["state"] == "finished" and first["turn"] == 1, first
+    handle, child = first["handle"], first["session_id"]
+
+    second = _parent_call(env, win, psid, "PARENT_SEND2",
+                          {"action": "send", "handle": handle, "task": "CHILD_SECOND write second.txt", "wait_seconds": 100}, "send2")
+    assert second["ok"] and second["state"] == "finished" and second["turn"] == 2, second
+    assert second["handle"] == handle and second["session_id"] == child
+    assert second["summary"] == "Wrote second.txt." and [o["relative"] for o in second["outputs"]] == ["second.txt"]
+    creates = [c for c in win.rpc_calls("session.create") if c["params_in"].get("cwd") == str(folder)]
+    assert len(creates) == 1, "the follow-up reuses the child session"
+    submits = _child_calls(win, "prompt.submit", handle)
+    assert [c["params_in"]["submission_id"] for c in submits] == [f"{handle}.submit.1", f"{handle}.submit.2"]
+    assert {c["params_in"]["session_id"] for c in submits} == {child}
+    turns = store_rows(env, "SELECT turn, state, submission_id FROM turns WHERE run_id=?", handle)
+    assert turns == [{"turn": 1, "state": "finished", "submission_id": f"{handle}.submit.1"}]
+    # the re-attach before the follow-up is seen (no submit into an unchecked session)
+    mine = [c["method"] for c in win.rpc_calls() if c["params_in"].get("session_id") == child]
+    second_submit = len(mine) - 1 - mine[::-1].index("prompt.submit")
+    assert "session.resume" in mine[mine.index("prompt.submit") + 1:second_submit], mine
+    assert_never_answers(win, env)
+
+
+def test_14_a_lost_submit_reply_after_the_turn_finished_repeats_the_identical_submit(env):
+    """The P1 cell: every reply to the child's prompt.submit is lost, the turn runs and finishes, the
+    run waits in submit_requested. The next claim re-attaches (lazy false, nothing pending), repeats the
+    identical submit and Hermes answers with the admission it took: one turn, no second start."""
+    win = env.window("verksted")
+    folder = folder_for(env, "p1")
+    env.model.when("CHILD_P1", Final("p1 ran once"))
+    win.inject("prompt.submit", "lose_reply", times=3, prefix={"submission_id": "vk-"})
+    parent_run(env, "P1", folder, "CHILD_P1 answer", wait=0)
+    psid, adm = parent_turn(env, win, "PARENT_P1 go", "p1")
+    handle = tool_result(wait_terminal(win, psid, adm["admission_id"]))["handle"]  # no tick: no reconcile yet
+    stuck = lambda: (store_rows(env, "SELECT session_id, claim_owner FROM runs WHERE run_id=? AND state='submit_requested' "
+                                     "AND (claim_expires_at IS NULL OR claim_expires_at <= ?)", handle, time.time()) or [None])[0]
+    end = time.monotonic() + 60
+    while not stuck() and time.monotonic() < end:  # the doorbell drives the start; no tick, no reconcile yet
+        time.sleep(0.5)
+    row = stuck()
+    assert row, store_rows(env, "SELECT state, claim_expires_at FROM runs WHERE run_id=?", handle)
+    assert len(_child_calls(win, "prompt.submit", handle)) == 3
+    idle = lambda: (s := win.request_profile("session.resume", session_id=row["session_id"], omit_messages=True)) and \
+        s.get("pending") == [] and s.get("running") is False and s
+    end = time.monotonic() + 60
+    while not idle() and time.monotonic() < end:
+        time.sleep(0.5)
+    assert [r for r in env.model.requests if "CHILD_P1" in r["user"]], "the first submit was admitted and ran"
+
+    done = pump(win, run_by_state(win, handle, "finished", "unknown", "refused"), what="run reconciled")
+    assert done["state"] == "finished" and done["outcome"] == "completed" and done["result_preview"] == "p1 ran once", done
+    submits = _child_calls(win, "prompt.submit", handle)
+    assert len(submits) == 4 and [c.get("injected") for c in submits] == ["lose_reply"] * 3 + [None]
+    assert len({json.dumps(c["params_wire"], sort_keys=True) for c in submits}) == 1, "identical every time"
+    assert len([r for r in env.model.requests if "CHILD_P1" in r["user"] and r["round"] == 0]) == 1, "one turn"
+    assert store_rows(env, "SELECT admission_id FROM runs WHERE run_id=?", handle)[0]["admission_id"]
+    assert len([c for c in win.rpc_calls("session.create") if c["params_in"].get("cwd") == str(folder)]) == 1
+    assert_never_answers(win, env)
+
+
+def test_16_the_result_block_is_checked_against_the_workspace_root(env):
+    win = env.window("verksted")
+    root = folder_for(env, "outputs")
+    (root / ".verksted.yaml").write_text("version: 1\ntoolsets: [file, e2eprobe]\n", encoding="utf-8")
+    step = root / "workflow" / "10-out"
+    step.mkdir(parents=True, exist_ok=True)
+    outside = env.work / "outside-k10"
+    outside.mkdir(exist_ok=True)
+    (outside / "secret.txt").write_text("not yours", encoding="utf-8")
+    escape = root / "escape"
+    if not escape.is_symlink():
+        escape.symlink_to(outside, target_is_directory=True)
+    block = ("Done.\n<verksted-result>\nsummary: Wrote the notes.\noutputs:\n- workflow/10-out/notes.md\n"
+             "- workflow/10-out/ghost.md\n" f"- {outside / 'secret.txt'}\n" "- escape/secret.txt\n</verksted-result>")
+    env.model.when("CHILD_OUT", WriteFile(str(step / "notes.md"), "K10-CONTENT-NEVER-STORED"), Final(block))
+    parent_run(env, "OUT", step, "CHILD_OUT write notes.md")
+    psid, adm = parent_turn(env, win, "PARENT_OUT go", "out")
+    out = tool_result(_terminal(win, psid, adm))
+    assert out["state"] == "finished" and out["result_block"] == "ok" and out["summary"] == "Wrote the notes.", out
+    assert [(o["relative"], o["kind"], o["size"]) for o in out["outputs"]] == [("workflow/10-out/notes.md", "file", 24)]
+    assert out["outputs"][0]["path"] == str(step / "notes.md") and out["outputs"][0]["modified_at"]
+    assert {m["path"]: m["reason"] for m in out["missing"]} == {
+        "workflow/10-out/ghost.md": "not_found", str(outside / "secret.txt"): "outside_workspace",
+        "escape/secret.txt": "outside_workspace"}
+    # the child was asked for the block, with the workspace root named
+    asked = [r["user"] for r in env.model.requests if "CHILD_OUT" in r["user"]][0]
+    assert "<verksted-result>" in asked and f"`{root}`" in asked
+    # references only: no file content in the store
+    ref = store_rows(env, "SELECT result_ref FROM runs WHERE run_id=?", out["handle"])[0]["result_ref"]
+    assert "K10-CONTENT-NEVER-STORED" not in ref and "not yours" not in ref
+    page = win.render("page")["text"]
+    assert "→ workflow/10-out/notes.md" in page and "✗ workflow/10-out/ghost.md (not_found)" in page, page[-800:]
+    assert_never_answers(win, env)
+
+
+def test_15_a_gateway_killed_mid_turn_leaves_the_run_unknown_and_nothing_is_retried(e2e):
+    """SIGKILL of the gateway owner while the child's turn runs: Hermes marks the started admission
+    unknown when it comes back (hermes_state_runtime.recover_session_inputs). The next window adopts the
+    run and reports unknown; no create, no submit, no resolve."""
+    env = e2e(PLUGINS).start()
+    a = env.window("verksted", name="a")
+    folder = folder_for(env, "kill")
+    env.model.when("CHILD_KILL", Final("never delivered", gate="kill"))
+    parent_run(env, "KILL", folder, "CHILD_KILL answer", wait=0)
+    psid, adm = parent_turn(env, a, "PARENT_KILL go", "kill")
+    handle = tool_result(_terminal(a, psid, adm))["handle"]
+    run = pump(a, _running(env, folder), what="child running")
+    assert env.model.gate_hit("kill")
+
+    pids = env.backend.leftover_pids()
+    assert pids
+    for pid in pids:
+        os.kill(pid, signal.SIGKILL)
+    end = time.monotonic() + 15
+    while env.backend.leftover_pids() and time.monotonic() < end:
+        time.sleep(0.2)
+    a.close()
+    env.model.release("kill")
+    env.backend.start()  # what the Desktop does on its next launch: hermes gateway ensure
+    conn = sqlite3.connect(env.backend.home / "plugin-data" / "verksted" / "data.db")
+    conn.execute("UPDATE runs SET claim_expires_at=? WHERE run_id=?", (time.time() - 1, handle))  # A's lease
+    conn.commit()
+    conn.close()
+
+    b = env.window("verksted", name="b")
+    done = pump(b, run_by_state(b, handle, "unknown", "finished", "refused"), what="run settled under window B")
+    assert done["state"] == "unknown" and done["reason"] == "admission_unknown", done
+    assert "session.create" not in sent_methods(b) and not _child_calls(b, "prompt.submit", handle), sent_methods(b)
+    receipts = [c for c in b.rpc_calls("prompt.receipt") if c["params_in"].get("admission_id") == run["admission_id"]]
+    assert receipts and receipts[-1]["ok"]
+    assert_never_answers(b, env)
+    # the parent (its turn ended before the kill) sees unknown with the hint, and nothing is retried
+    status = _parent_call(env, b, psid, "STATUS_KILL", {"action": "status", "handle": handle}, "kill2")
+    assert status["state"] == "unknown" and "Nothing is retried" in status["hint"], status
+    for _ in range(3):
+        b.tick()
+    assert not _child_calls(b, "prompt.submit", handle) and "session.create" not in sent_methods(b)

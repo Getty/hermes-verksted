@@ -7,7 +7,11 @@ standalone module that may run in another process. They share nothing but the da
 Every write runs in one ``BEGIN IMMEDIATE`` transaction on a connection opened for that call, so
 a claim grant and the state change it allows are atomic, and a higher claim generation locks out
 confirmations of an older one. The store keeps assignments, ids, the claim, the frozen
-configuration with its fingerprint, the last known state and a result reference — no history.
+configuration with its fingerprint, the last known state and a result reference — no history
+beyond the earlier turns of a run that ``send`` continued (table ``turns``).
+
+Schema 2 (cards k8, k10) adds the stop request, the turn counter with its archive and the states
+``send_waiting`` and ``cancelled``; a schema-1 store is migrated in place, in one transaction.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PLUGIN_NAME = "verksted"
 
 # A run is "active" while it holds its folder. The unique partial index below makes "one active run
@@ -30,8 +34,10 @@ ACTIVE_STATES = (
     "toolsets_checked",  # the effective toolsets passed the check
     "submit_requested",  # the Desktop part is about to call (or called) prompt.submit
     "running",           # the prompt was admitted (accepted, not done)
+    "send_waiting",      # a follow-up turn for the same child session is stored (verksted send)
 )
-FINAL_STATES = ("finished", "refused", "unknown")
+# "cancelled": stopped before the turn's prompt was submitted, so Hermes never saw the task.
+FINAL_STATES = ("finished", "refused", "unknown", "cancelled")
 STATES = ACTIVE_STATES + FINAL_STATES
 
 # Steps the Desktop part may record, by current state. "refused" means Hermes or Verksted's own check
@@ -41,9 +47,15 @@ TRANSITIONS: dict[str, frozenset[str]] = {
     "create_requested": frozenset({"session_created", "refused", "unknown"}),
     "session_created": frozenset({"toolsets_checked", "refused", "unknown"}),
     "toolsets_checked": frozenset({"submit_requested", "refused", "unknown"}),
-    "submit_requested": frozenset({"running", "refused", "unknown"}),
+    "submit_requested": frozenset({"running", "refused", "unknown", "cancelled"}),
     "running": frozenset({"running", "finished", "unknown"}),
+    "send_waiting": frozenset({"submit_requested", "refused"}),
 }
+# Before the prompt is submitted a stop needs nobody: the run ends ``cancelled`` at once, and the
+# Desktop part's next fenced step is refused. From ``submit_requested`` on only Hermes can stop it.
+CANCEL_AT_ONCE = ("waiting_for_gui", "create_requested", "session_created", "toolsets_checked", "send_waiting")
+# Runs a follow-up turn (``send``) may continue: the child session exists and its last turn ended.
+SENDABLE_STATES = ("finished", "cancelled")
 
 # Fields of the Desktop part's connection identity. "subject" comes from the plugin API's host
 # authentication, the others from the route descriptor and runtime.describe.
@@ -51,8 +63,30 @@ IDENTITY_FIELDS = ("connection_id", "route_profile", "target_profile", "profile_
 
 RESULT_TEXT_LIMIT = 32 * 1024
 DETAIL_TEXT_LIMIT = 2000
+SUMMARY_LIMIT = 2000
+OUTPUTS_LIMIT = 50
+PATH_LIMIT = 1024
+NOTES_LIMIT = 8
 
 _ACTIVE_SQL = ", ".join(f"'{s}'" for s in ACTIVE_STATES)
+
+# Earlier turns of a run, archived when ``send`` stores the next one; the current turn lives on
+# ``runs``, so the claim, start and tracking code reads one row.
+_TURNS = """CREATE TABLE IF NOT EXISTS turns (
+    run_id TEXT NOT NULL,
+    turn INTEGER NOT NULL,
+    submission_id TEXT NOT NULL UNIQUE,
+    task TEXT NOT NULL,
+    prompt_text TEXT NOT NULL,
+    state TEXT NOT NULL,
+    state_detail TEXT NOT NULL DEFAULT '{}',
+    admission_id TEXT,
+    outcome TEXT,
+    result_ref TEXT,
+    cancel_requested_at REAL,
+    finished_at REAL,
+    PRIMARY KEY (run_id, turn)
+)"""
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -94,7 +128,9 @@ CREATE TABLE IF NOT EXISTS runs (
     effective_toolsets TEXT,
     outcome TEXT,
     result_ref TEXT,
-    finished_at REAL
+    finished_at REAL,
+    cancel_requested_at REAL,
+    turn_no INTEGER NOT NULL DEFAULT 1
 );
 CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_per_folder
     ON runs(target_key) WHERE state IN ({_ACTIVE_SQL});
@@ -105,7 +141,18 @@ CREATE TABLE IF NOT EXISTS session_aliases (
     alias TEXT PRIMARY KEY,
     session_id TEXT NOT NULL
 );
+{_TURNS}
 """
+
+# Schema 1 -> 2, in the same transaction as the version bump. The partial index names the active
+# states, so it is rebuilt for "send_waiting".
+_MIGRATE_1_TO_2 = (
+    "ALTER TABLE runs ADD COLUMN cancel_requested_at REAL",
+    "ALTER TABLE runs ADD COLUMN turn_no INTEGER NOT NULL DEFAULT 1",
+    _TURNS,
+    "DROP INDEX IF EXISTS runs_one_active_per_folder",
+    f"CREATE UNIQUE INDEX runs_one_active_per_folder ON runs(target_key) WHERE state IN ({_ACTIVE_SQL})",
+)
 
 _JSON_COLUMNS = ("resolved_config", "expected_toolsets", "create_params", "state_detail",
                  "claim_principal", "effective_toolsets", "result_ref")
@@ -194,8 +241,12 @@ class Store:
             if found > SCHEMA_VERSION:
                 raise StoreError("schema_too_new",
                                  f"store schema {found} is newer than this Verksted ({SCHEMA_VERSION})")
-            for statement in _SCHEMA.split(";"):
-                if statement.strip():
+            if found == 0:
+                for statement in _SCHEMA.split(";"):
+                    if statement.strip():
+                        conn.execute(statement)
+            else:  # found == 1: the only older schema
+                for statement in _MIGRATE_1_TO_2:
                     conn.execute(statement)
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
                          (str(SCHEMA_VERSION),))
@@ -342,8 +393,9 @@ class Store:
         """Grant a lease on an active run and raise its claim generation, atomically.
 
         A live claim of another owner refuses with ``claimed``. ``mode`` is ``start`` while nothing
-        was requested from Hermes yet, otherwise ``reconcile``: the claimant may only repeat the
-        stored calls under the stored identity, or mark the run ``unknown``.
+        was requested from Hermes yet for the current turn (``waiting_for_gui``, ``send_waiting``),
+        otherwise ``reconcile``: the claimant may only repeat the stored calls under the stored
+        identity, or mark the run ``unknown``.
         """
         if not owner:
             raise StoreError("bad_owner", "claim owner must be a non-empty string")
@@ -366,7 +418,8 @@ class Store:
                 (owner, generation, expires, _dumps(principal) if principal is not None else None, now, run_id))
             run = self._row(conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone())
             return {"generation": generation, "expires_at": expires,
-                    "mode": "start" if row["state"] == "waiting_for_gui" else "reconcile", "run": run}
+                    "mode": "start" if row["state"] in ("waiting_for_gui", "send_waiting") else "reconcile",
+                    "run": run}
 
         return self._write(op)
 
@@ -404,6 +457,100 @@ class Store:
             return {"released": True}
         return self._write(op)
 
+    # -- stop and follow-up turns ------------------------------------------------------------
+
+    def request_cancel(self, run_id: str) -> dict[str, Any]:
+        """Store a stop request (``verksted cancel``), atomically with what it allows.
+
+        ``cancel`` in the answer: ``not_started`` — the prompt was not submitted yet, the run is
+        ``cancelled`` now and the Desktop part's next step is refused; ``requested`` — the prompt
+        may have reached Hermes, so the window that holds the run asks Hermes to stop it and only
+        Hermes' terminal receipt ends it; ``already_final`` — nothing to stop.
+        """
+        def op(conn: sqlite3.Connection, now: float) -> dict[str, Any]:
+            row = self._row(conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone())
+            if row is None:
+                raise StoreError("not_found", "no such run")
+            if row["state"] in FINAL_STATES:
+                return {"cancel": "already_final", "run": row}
+            if row["state"] in CANCEL_AT_ONCE:
+                conn.execute(
+                    "UPDATE runs SET state='cancelled', state_detail=?, cancel_requested_at=?, finished_at=?, "
+                    "updated_at=? WHERE run_id=?",
+                    (_dumps({"reason": "cancelled_before_submit", "after": row["state"]}), now, now, now, run_id))
+                answer = "not_started"
+            else:
+                if row["cancel_requested_at"] is None:
+                    conn.execute("UPDATE runs SET cancel_requested_at=?, updated_at=? WHERE run_id=?",
+                                 (now, now, run_id))
+                answer = "requested"
+            return {"cancel": answer,
+                    "run": self._row(conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone())}
+        return self._write(op)
+
+    def start_send(self, run_id: str, *, task: str, prompt_text: str, max_active: int) -> dict[str, Any]:
+        """Store a follow-up turn for the run's child session (``verksted send``) in
+        ``send_waiting``, with its new ``submission_id``, before anything is requested.
+
+        Only a run whose last turn ended (``finished``, or ``cancelled`` with a child session) can
+        be continued; the ended turn moves to ``turns``. Refuses ``run_active``, ``outcome_unknown``
+        (Hermes would queue the turn behind the unresolved one), ``not_sendable``, ``folder_busy``
+        and ``too_many_runs``.
+        """
+        def op(conn: sqlite3.Connection, now: float) -> dict[str, Any]:
+            row = self._row(conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone())
+            if row is None:
+                raise StoreError("not_found", "no such run")
+            if row["state"] in ACTIVE_STATES:
+                raise StoreError("run_active", f"the run is still {row['state']}; wait for it to end first",
+                                 state=row["state"])
+            if row["state"] == "unknown":
+                raise StoreError("outcome_unknown", "the run's last turn has an unknown outcome; the user resolves "
+                                                    "it in the child session first", state="unknown")
+            if row["state"] not in SENDABLE_STATES or not row["session_id"]:
+                raise StoreError("not_sendable", f"a {row['state']} run without a child session cannot be "
+                                                 "continued; start a new run", state=row["state"])
+            busy = conn.execute(
+                f"SELECT run_id FROM runs WHERE target_key=? AND state IN ({_ACTIVE_SQL})",
+                (row["target_key"],)).fetchone()
+            if busy:
+                raise StoreError("folder_busy", "another Verksted run is active in this folder", run_id=busy[0])
+            active = conn.execute(f"SELECT COUNT(*) FROM runs WHERE state IN ({_ACTIVE_SQL})").fetchone()[0]
+            if active >= max_active:
+                raise StoreError("too_many_runs",
+                                 f"{active} Verksted runs are active in this profile (limit {max_active})")
+            raw = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            conn.execute(
+                "INSERT INTO turns (run_id, turn, submission_id, task, prompt_text, state, state_detail, "
+                "admission_id, outcome, result_ref, cancel_requested_at, finished_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(raw[k] for k in ("run_id", "turn_no", "submission_id", "task", "prompt_text", "state",
+                                       "state_detail", "admission_id", "outcome", "result_ref",
+                                       "cancel_requested_at", "finished_at")))
+            turn = int(raw["turn_no"]) + 1
+            conn.execute(
+                "UPDATE runs SET turn_no=?, submission_id=?, task=?, prompt_text=?, state='send_waiting', "
+                "state_detail='{}', admission_id=NULL, outcome=NULL, result_ref=NULL, finished_at=NULL, "
+                "cancel_requested_at=NULL, claim_expires_at=?, updated_at=? WHERE run_id=?",
+                # The claim of the ended turn expires (its generation stays and fences the old
+                # holder), so any window can claim the new turn at once.
+                (turn, f"{run_id}.submit.{turn}", task, prompt_text, now, now, run_id))
+            return self._row(conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone())
+        return self._write(op)
+
+    def turns(self, run_id: str) -> list[dict[str, Any]]:
+        """The run's earlier turns, oldest first (the current one is the run row itself)."""
+        def op(conn: sqlite3.Connection, now: float) -> list[dict[str, Any]]:
+            out = []
+            for r in conn.execute("SELECT * FROM turns WHERE run_id=? ORDER BY turn", (run_id,)).fetchall():
+                item = dict(r)
+                for key in ("state_detail", "result_ref"):
+                    if item.get(key) is not None:
+                        item[key] = json.loads(item[key])
+                out.append(item)
+            return out
+        return self._read(op)
+
     # -- steps --------------------------------------------------------------------------------
 
     def record_step(self, run_id: str, owner: str, generation: int, step: str,
@@ -427,6 +574,8 @@ class Store:
             if step not in TRANSITIONS.get(row["state"], frozenset()):
                 raise StoreError("bad_transition", f"{row['state']} -> {step} is not allowed",
                                  state=row["state"])
+            if step == "cancelled" and row["cancel_requested_at"] is None:
+                raise StoreError("bad_transition", "only a requested stop ends a run as cancelled", state=row["state"])
             sets: dict[str, Any] = {"state": step, "updated_at": now, "last_known_at": now}
             identity = _identity(data.get("identity"), principal)
             if step == "create_requested":
@@ -463,10 +612,12 @@ class Store:
                 outcome = data.get("outcome")
                 if not isinstance(outcome, str) or not outcome:
                     raise StoreError("bad_data", "finished needs outcome")
-                text, truncated = _clip(data.get("final_response"), RESULT_TEXT_LIMIT)
-                sets.update(outcome=outcome, finished_at=now, state_detail="{}", result_ref=_dumps({
-                    "session_id": row["session_id"], "admission_id": row["admission_id"],
-                    "final_response": text, "truncated": truncated}))
+                sets.update(outcome=outcome, finished_at=now, state_detail="{}",
+                            result_ref=_dumps(_result_ref(row, data, now)))
+            elif step == "cancelled":
+                reason = data.get("reason") if isinstance(data.get("reason"), str) and data.get("reason") \
+                    else "cancelled_before_submit"
+                sets.update(finished_at=now, state_detail=_dumps({"reason": reason, "after": row["state"]}))
             elif step in ("refused", "unknown"):
                 reason = data.get("reason")
                 if not isinstance(reason, str) or not reason:
@@ -480,6 +631,66 @@ class Store:
             return self._row(conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone())
 
         return self._write(op)
+
+
+def _result_ref(row: dict[str, Any], data: dict[str, Any], now: float) -> dict[str, Any]:
+    """The result reference of a finished turn (v2): the clipped final answer, the closing block's
+    summary and the output paths the plugin API checked against the workspace root (card k10), and
+    the Rückfragen and approvals that went unanswered (card k8). File contents are never stored."""
+    text, truncated = _clip(data.get("final_response"), RESULT_TEXT_LIMIT)
+    check = data.get("result") if isinstance(data.get("result"), dict) else {}
+    block = check.get("block") if check.get("block") in ("ok", "missing", "unparsable") else "missing"
+    detail = check.get("detail") if isinstance(check.get("detail"), str) else None
+    if not check:
+        detail = "no result check was recorded"
+    summary = check.get("summary") if block == "ok" and isinstance(check.get("summary"), str) else None
+    summary_cut = False
+    if summary is not None:
+        summary, summary_cut = _clip(summary, SUMMARY_LIMIT)
+    outputs = [_entry(o, ("path", "relative", "kind", "size", "mtime")) for o in _items(check.get("outputs"))]
+    missing = [_entry(m, ("path", "reason")) for m in _items(check.get("missing"))]
+    return {
+        "v": 2, "session_id": row["session_id"], "admission_id": row["admission_id"],
+        "final_response": text, "truncated": truncated,
+        "block": block, "block_detail": _clip(detail, 500)[0] if detail else None,
+        "summary": summary, "outputs": outputs[:OUTPUTS_LIMIT], "missing": missing[:OUTPUTS_LIMIT],
+        "result_truncated": bool(check.get("truncated")) or summary_cut
+        or len(outputs) > OUTPUTS_LIMIT or len(missing) > OUTPUTS_LIMIT,
+        "root": check.get("root") if isinstance(check.get("root"), str) else None,
+        "checked_at": now if check else None,
+        "unanswered": [_entry(q, ("question",)) for q in _items(data.get("unanswered"))][:NOTES_LIMIT],
+        "blocked": [_entry(b, ("command", "reason")) for b in _items(data.get("blocked"))][:NOTES_LIMIT],
+    }
+
+
+def result_view(ref: Any) -> dict[str, Any]:
+    """A stored result reference in the v2 shape; a v1 reference (schema 1, before card k10) has
+    no checked block and says so instead of guessing one."""
+    ref = ref if isinstance(ref, dict) else {}
+    if ref.get("v") == 2:
+        return ref
+    return {"v": 1, "session_id": ref.get("session_id"), "admission_id": ref.get("admission_id"),
+            "final_response": ref.get("final_response") or "", "truncated": bool(ref.get("truncated")),
+            "block": "missing", "block_detail": "recorded by an earlier Verksted build, before outputs were checked",
+            "summary": None, "outputs": [], "missing": [], "result_truncated": False, "root": None,
+            "checked_at": None, "unanswered": [], "blocked": []}
+
+
+def _items(raw: Any) -> list[dict[str, Any]]:
+    return [x for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
+
+
+def _entry(raw: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, str):
+            out[key] = _clip(value, PATH_LIMIT)[0]
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[key] = value
+        else:
+            out[key] = None
+    return out
 
 
 def _identity(raw: Any, principal: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:

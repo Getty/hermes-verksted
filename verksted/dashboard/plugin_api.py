@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -35,17 +36,20 @@ LEASE_MAX_S = 600.0
 OWNER_MAX = 128
 
 
-def _load_store():
-    path = Path(__file__).resolve().parent.parent / "store.py"
-    spec = importlib.util.spec_from_file_location("verksted_dashboard_store", path)
+def _load(name: str):
+    path = Path(__file__).resolve().parent.parent / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"verksted_dashboard_{name}", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"verksted: cannot load {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses (paths.Backend) look their module up there
     spec.loader.exec_module(module)
     return module
 
 
-_vstore = _load_store()
+_vstore = _load("store")
+_vpaths = _load("paths")    # the backend's path rules, for the output check (card k10)
+_vresult = _load("result")
 router = APIRouter()
 
 
@@ -144,16 +148,25 @@ def _summary(run: dict[str, Any], now: float) -> dict[str, Any]:
                   "expires_at": run.get("claim_expires_at"),
                   "live": (run.get("claim_expires_at") or 0) > now},
         "outcome": run.get("outcome"),
+        "turn": run.get("turn_no") or 1,
+        # A stop the tool stored (card k8): the window that holds the run asks Hermes to stop it.
+        "cancel_requested": run.get("cancel_requested_at") is not None,
     }
     if run["state"] == "running":
         out["receipt_status"] = detail.get("receipt_status")
         out["prompts"] = detail.get("prompts") or []
-    if run["state"] in ("refused", "unknown"):
+    if run["state"] in ("refused", "unknown", "cancelled"):
         out["reason"] = detail.get("reason")
         out["detail"] = detail.get("detail")
     if run["state"] == "finished":
-        result = run.get("result_ref") or {}
-        out["result_preview"] = (result.get("final_response") or "")[:500]
+        result = _vstore.result_view(run.get("result_ref"))
+        out["result_preview"] = (result.get("summary") or result.get("final_response") or "")[:500]
+        out["result_block"] = result["block"]
+        out["outputs"] = [{"relative": o.get("relative"), "path": o.get("path"), "kind": o.get("kind")}
+                          for o in result["outputs"]]
+        out["missing"] = result["missing"]
+        out["unanswered"] = result["unanswered"]
+        out["blocked"] = result["blocked"]
     return out
 
 
@@ -221,9 +234,18 @@ def _step(run_id: str, body: dict[str, Any], principal: dict[str, Any]) -> dict[
     name = body.get("step")
     if not isinstance(name, str):
         return _refuse("bad_step", "step must be a state name")
-    data = body.get("data")
-    run = _store().record_step(run_id, _owner(body), _generation(body), name,
-                               data if isinstance(data, dict) else {}, principal=principal)
+    data = dict(body.get("data")) if isinstance(body.get("data"), dict) else {}
+    store = _store()
+    if name == "finished":
+        # The output check (card k10) runs here, on the backend, when the run finishes: the final
+        # answer's closing block is parsed and each named path checked against the workspace root
+        # frozen at run. Whatever result the Desktop part sent along is replaced.
+        data.pop("result", None)
+        run = store.get_run(run_id)
+        if run is not None:
+            root = (run.get("resolved_config") or {}).get("workspace") or run["target_dir"]
+            data["result"] = _vresult.check(data.get("final_response"), root, _vpaths.LOCAL)
+    run = store.record_step(run_id, _owner(body), _generation(body), name, data, principal=principal)
     return {"ok": True, "run": _summary(run, _now())}
 
 

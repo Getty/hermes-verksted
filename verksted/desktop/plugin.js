@@ -1,5 +1,6 @@
 // Verksted Desktop part: claims runs the verksted tool stored and starts each one as a regular
-// Hermes session through the public Desktop SDK, then follows it until Hermes reports the end.
+// Hermes session through the public Desktop SDK, then follows it until Hermes reports the end. It
+// also carries out follow-up turns (`verksted send`) and stop requests (`verksted cancel`).
 //
 // Calls checked against Hermes ad2b705 (docs/hermes-interfaces.md, docs/toolset-check.md):
 // host.profileRoutes / requestProfile / retainProfile / openSession, ctx.rest, ctx.onEvent, and
@@ -25,6 +26,8 @@ export const REPEATS = 3            // identical repeats after a lost reply, the
 // the user in that session, never by this part, and no headless or auto-approving flag is ever sent.
 // No `title` on session.create: Hermes resolves a title to an existing session before it looks at
 // request_id (gateway/session_controls.py:467-492), so only request_id may pick the session.
+// prompt.cancel is scoped to Verksted's own admission (gateway/session_controls.py:872-894): it
+// cannot stop a turn the user typed into the child. It is sent only for a stop the tool stored.
 export const ALLOWED_CALLS = Object.freeze({
   'runtime.describe': [],
   'session.create': ['cwd', 'cwd_explicit', 'request_id', 'toolsets'],
@@ -32,7 +35,8 @@ export const ALLOWED_CALLS = Object.freeze({
   'session.resume': ['session_id', 'omit_messages'],
   'tools.show': ['session_id'],
   'prompt.submit': ['session_id', 'text', 'submission_id'],
-  'prompt.receipt': ['session_id', 'admission_id', 'include_result']
+  'prompt.receipt': ['session_id', 'admission_id', 'include_result'],
+  'prompt.cancel': ['session_id', 'admission_id']
 })
 
 export const LABELS = Object.freeze({
@@ -44,12 +48,21 @@ export const LABELS = Object.freeze({
   running: 'läuft',
   finished: 'fertig',
   refused: 'abgelehnt',
-  unknown: 'unbekannt'
+  unknown: 'unbekannt',
+  send_waiting: 'Folgeauftrag wartet auf Hermes Desktop',
+  cancelled: 'abgebrochen'
+})
+export const STOPPING_LABEL = 'wird gestoppt'
+export const RESULT_BLOCK_LABELS = Object.freeze({
+  missing: 'kein Ergebnisblock', unparsable: 'Ergebnisblock unlesbar'
 })
 export const WAITING_LABELS = Object.freeze({ clarify: 'Rückfrage', approval: 'Freigabe erforderlich' })
 const STARTED = ['create_requested', 'session_created', 'toolsets_checked', 'submit_requested', 'running']
-const FINAL = ['finished', 'refused', 'unknown']
+const FINAL = ['finished', 'refused', 'unknown', 'cancelled']
 const CLAIM_GONE = ['stale_generation', 'lease_expired', 'final', 'not_found']
+// A step refused because the run moved on without this window (a newer claim, a stop the tool
+// stored before the submit): the window lets go quietly.
+const MOVED_ON = [...CLAIM_GONE, 'bad_transition']
 // store.py IDENTITY_FIELDS: `subject` is the host-authenticated principal of the plugin API requests.
 const IDENTITY_KEYS = ['connection_id', 'route_profile', 'target_profile', 'profile_id', 'subject']
 
@@ -86,6 +99,15 @@ export function guardCall(method, params) {
 }
 
 export const isRpcError = err => !!err && typeof err.code === 'number'
+
+/** A refusal that says "not now" rather than "no": the gateway drains for a restart (4001
+ *  runtime_draining, gateway/drain_control.py:81-90) or its storage failed (5001). Like a lost
+ *  reply it is tried again later and never counts toward giving a run up. */
+export function isTransient(err) {
+  if (!isRpcError(err)) return true
+  const data = err.data && typeof err.data === 'object' ? err.data : {}
+  return err.code === 5001 || data.reason === 'runtime_draining'
+}
 
 export function failureOf(err) {
   const data = err && err.data && typeof err.data === 'object' ? err.data : {}
@@ -149,14 +171,16 @@ export function pendingPrompts(snapshot) {
 /** docs/toolset-check.md §6 step 3 / §7, with Verksted's own toolset tolerated (decision M2).
  *  `expected` is the stored list E (null = default case D1 (a)); `baseline` is the set the first
  *  check recorded, used in the default case to refuse a set that grew. `tolerateOwn` (M2) is false
- *  for a run in another profile than the parent's: the recursion guard cannot see children there. */
-export function checkInfo(info, expected, baseline, tolerateOwn = true) {
+ *  for a run in another profile than the parent's: the recursion guard cannot see children there.
+ *  `lazyRelaxed`: a session that already ran a turn (a follow-up `send`, §6 step 6, or the repeat
+ *  of an unconfirmed submit) no longer needs `lazy: true`; the set is checked all the same. */
+export function checkInfo(info, expected, baseline, tolerateOwn = true, { lazyRelaxed = false } = {}) {
   const notCheckable = detail => ({ ok: false, refusal: { reason: 'toolsets_not_checkable', detail } })
   if (!info || typeof info !== 'object') return notCheckable('the reply carries no session info')
   if (info.desktop_protocol !== CANONICAL_PROTOCOL) {
     return notCheckable(`the route does not speak ${CANONICAL_PROTOCOL} (got ${info.desktop_protocol || 'nothing'})`)
   }
-  if (info.lazy !== true) return notCheckable('the session already has an agent; its tools can no longer be attested before the first prompt')
+  if (info.lazy !== true && !lazyRelaxed) return notCheckable('the session already has an agent; its tools can no longer be attested before the first prompt')
   const raw = info.enabled_toolsets
   if (!Array.isArray(raw) || !raw.every(name => typeof name === 'string')) return notCheckable('enabled_toolsets is missing or not a list of names')
   const effective = [...new Set(raw)].sort()
@@ -216,8 +240,12 @@ export function onlyOwnTools(shown, tolerateOwn = true) {
 /** Reconciling a submit that may already have been admitted, from a fresh `session.resume`
  *  snapshot: `pending` lists the non-terminal admissions with `input_id` = the submission id
  *  (gateway/session_authority.py:451-460). Returns { adopt, status } for our own admission,
- *  { unclear } when the snapshot cannot rule one out, or { check } with the toolset check of a
- *  session in which nothing ran yet. */
+ *  { unclear } when the snapshot cannot rule one out, or { check, lazy } when nothing of ours is
+ *  pending and nothing else runs: then the identical prompt.submit goes out again after the check.
+ *  Hermes answers it with our admission if it took the first one (an exact or terminal replay,
+ *  hermes_state_runtime.py:128-162) or admits it now as the only start — idempotent by
+ *  submission_id + text, never a second turn (card k8, P1). `lazy` true means the session never
+ *  ran a turn, so nothing was admitted. */
 export function submitVerdict(snap, expected, baseline, submissionId, tolerateOwn = true) {
   const pending = snap && Array.isArray(snap.pending) ? snap.pending : null
   const mine = pending && pending.find(p => p && p.input_id === submissionId && typeof p.admission_id === 'string' && p.admission_id)
@@ -225,10 +253,53 @@ export function submitVerdict(snap, expected, baseline, submissionId, tolerateOw
   if (!pending) return { unclear: 'the session snapshot lists no admissions' }
   if (pending.length || snap.running === true) return { unclear: 'another turn is queued or running in the session' }
   const info = snap.info
-  if (!info || typeof info !== 'object' || info.lazy !== true) {
-    return { unclear: 'the session already has an agent or reports no info; its tools can no longer be attested' }
+  if (!info || typeof info !== 'object') return { unclear: 'the session snapshot reports no info' }
+  return { check: checkInfo(info, expected, baseline, tolerateOwn, { lazyRelaxed: true }), lazy: info.lazy === true }
+}
+
+function parseJson(text) {
+  if (typeof text !== 'string') return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
   }
-  return { check: checkInfo(info, expected, baseline, tolerateOwn) }
+}
+
+/** What went unanswered in a finished turn, from `prompt.receipt {include_result}` →
+ *  `result.messages` (this turn's rows; the only place it shows after the fact). A Rückfrage of a
+ *  Desktop turn is a batch clarify: with no attached viewer it ends at once as `unanswered`
+ *  (tools/clarify_tool.py:87-112, gateway/session_server_requests.py:172-173). An approval nobody
+ *  gave in time fails closed as a tool row `status: "blocked"` (tools/terminal_tool.py:1137). */
+export function resultNotes(result) {
+  const messages = result && Array.isArray(result.messages) ? result.messages : []
+  const calls = new Map()
+  for (const m of messages) {
+    for (const call of (m && Array.isArray(m.tool_calls) ? m.tool_calls : [])) {
+      const fn = call && call.function
+      if (call && typeof call.id === 'string' && fn) calls.set(call.id, { name: fn.name, args: parseJson(fn.arguments) || {} })
+    }
+  }
+  const unanswered = []
+  const blocked = []
+  for (const m of messages) {
+    if (!m || m.role !== 'tool') continue
+    const body = parseJson(m.content)
+    if (!body || typeof body !== 'object') continue
+    if (Array.isArray(body.responses)) {
+      for (const r of body.responses) {
+        if (r && r.status === 'unanswered') unanswered.push({ question: String(r.question || '').slice(0, 500) })
+      }
+    }
+    if (body.status === 'blocked') {
+      const call = calls.get(m.tool_call_id) || {}
+      const args = call.args || {}
+      const command = typeof args.command === 'string' ? args.command : (call.name || m.name || m.tool_name || 'tool')
+      const why = String(body.error || '')
+      blocked.push({ command: command.slice(0, 500), reason: /denied/i.test(why) ? 'denied' : /timed out/i.test(why) ? 'timeout' : 'blocked' })
+    }
+  }
+  return { unanswered: unanswered.slice(0, 8), blocked: blocked.slice(0, 8) }
 }
 
 function randomId() {
@@ -245,7 +316,9 @@ const enc = encodeURIComponent
  */
 export function createWorker({ host, rest, owner, log = () => {}, sleep, now = () => Date.now() }) {
   const wait = sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)))
-  const held = new Map() // run_id → { generation, tracking, route, identity, sessionId, admissionId, failures, busy }
+  // run_id → { generation, tracking, route, identity, sessionId, admissionId, failures, busy,
+  //            release (the route retain), cancelRequested, cancelSent }
+  const held = new Map()
   const listeners = new Set()
   let view = { runs: [], profileHome: null, note: null, updatedAt: null }
   let polling = null
@@ -296,13 +369,29 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
     if (!h) throw new StepRefused({ code: 'not_held', message: 'this window no longer holds the claim' })
     const answer = await api(`/runs/${enc(runId)}/step`, { owner, generation: h.generation, step: name, data: data || {} })
     if (!answer || answer.ok !== true) throw new StepRefused(answer)
+    // A stop the tool stored reaches the holder with the answer to its next step.
+    if (answer.run && answer.run.cancel_requested) h.cancelRequested = true
     return answer.run
   }
 
-  const letGo = async runId => {
+  // Forget a run and give its route back (the retain kept the child attached while it was followed).
+  const drop = runId => {
     const h = held.get(runId)
-    if (!h) return
+    if (!h) return null
     held.delete(runId)
+    if (typeof h.release === 'function') {
+      try {
+        h.release()
+      } catch (err) {
+        log('verksted: route release failed', err)
+      }
+    }
+    return h
+  }
+
+  const letGo = async runId => {
+    const h = drop(runId)
+    if (!h) return
     try {
       await api(`/runs/${enc(runId)}/release`, { owner, generation: h.generation })
     } catch (err) {
@@ -310,7 +399,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
     }
   }
 
-  // -- one start, on one retained route ------------------------------------------------------
+  // -- one start, on one retained route (take() holds the retain) --------------------------------
   async function drive(runId, run, route, identity) {
     const expected = Array.isArray(run.expected_toolsets) ? run.expected_toolsets : null
     const tolerateOwn = run.own_toolset_tolerated === true // fail closed: only the API says so
@@ -339,135 +428,139 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
       return { running: true, sessionId, admissionId: adm }
     }
 
-    const release = await host.retainProfile(route)
-    try {
-      let info = null
-      let snap = null
-      let attachedAt = epoch
-      let sent = state === 'submit_requested' // an earlier claim may have sent the submit
-      if (state === 'waiting_for_gui') {
-        await step(runId, 'create_requested', { identity })
-        state = 'create_requested'
-      }
-      if (state === 'create_requested') {
-        let created
-        attachedAt = epoch
-        try {
-          created = await rpcRepeat(route, 'session.create', run.create_params)
-        } catch (err) {
-          if (err instanceof Deferred) throw err
-          return refuse(err && err.guard ? { reason: 'bad_create_params', detail: err.message } : rpcRefusal(err, 'create_refused'))
-        }
-        sessionId = created && created.session_id
-        if (typeof sessionId !== 'string' || !sessionId) {
-          return refuse({ reason: 'create_refused', detail: 'session.create answered without a session_id' })
-        }
-        info = created.info || null
-        await step(runId, 'session_created', {
-          identity, session_id: sessionId,
-          ...(info && Array.isArray(info.enabled_toolsets) ? { enabled_toolsets: info.enabled_toolsets } : {})
-        })
-        state = 'session_created'
-      } else {
-        // A new claim means a new socket: re-attach first (toolset-check.md §6 step 5).
-        attachedAt = epoch
-        try {
-          snap = await resume()
-          info = (snap && snap.info) || null
-        } catch (err) {
-          if (err instanceof Deferred) throw err
-          if (sent) return unsure(`session.resume failed: ${failureOf(err).detail}`)
-          return refuse(rpcRefusal(err, 'resume_refused'))
-        }
-      }
-
-      let baseline = Array.isArray(run.effective_toolsets) ? run.effective_toolsets : null
-      if (state === 'session_created') {
-        const first = checkInfo(info, expected, null, tolerateOwn)
-        if (!first.ok) return refuse(first.refusal)
-        let shown
-        try {
-          shown = await rpcRepeat(route, 'tools.show', { session_id: sessionId })
-        } catch (err) {
-          if (err instanceof Deferred) throw err
-          return refuse({ reason: 'toolsets_not_checkable', detail: `tools.show failed: ${failureOf(err).detail}` })
-        }
-        const total = shown && typeof shown.total === 'number' ? shown.total : null
-        if (total === null) return refuse({ reason: 'toolsets_not_checkable', detail: 'tools.show answered without a total' })
-        if (!first.effective.some(name => name !== OWN_TOOLSET)) {
-          // E = [] or a default case that reads empty: only tools.show tells apart "nothing
-          // selected" from an inventory that failed open (toolset-check.md §10 M2).
-          const why = onlyOwnTools(shown, tolerateOwn)
-          if (why) return refuse({ reason: 'toolsets_not_checkable', detail: why })
-        }
-        await step(runId, 'toolsets_checked', {
-          identity, enabled_toolsets: first.effective, check: { effective: first.effective, tools_total: total }
-        })
-        state = 'toolsets_checked'
-        baseline = first.effective
-      }
-
-      if (state === 'toolsets_checked') {
-        let again
-        try {
-          again = await rpcRepeat(route, 'session.info', { session_id: sessionId })
-        } catch (err) {
-          if (err instanceof Deferred) throw err
-          return refuse({ reason: 'toolsets_not_checkable', detail: `session.info failed: ${failureOf(err).detail}` })
-        }
-        const second = checkInfo(again, expected, baseline, tolerateOwn)
-        if (!second.ok) return refuse(second.refusal)
-        await step(runId, 'submit_requested', { identity })
-        state = 'submit_requested'
-      } else if (state === 'submit_requested') {
-        // Reconciling an unconfirmed submit: decide from the fresh snapshot, never repeat blindly.
-        const verdict = submitVerdict(snap, expected, baseline, run.submission_id, tolerateOwn)
-        if (verdict.adopt) return running(verdict.adopt, verdict.status)
-        if (verdict.unclear) return unsure(verdict.unclear)
-        if (!verdict.check.ok) return refuse(verdict.check.refusal)
-      }
-
-      // prompt.submit, repeated identically after a lost reply. A reconnect since the session was
-      // attached is answered by re-attaching here, seen, and deciding again from that snapshot.
-      let last = null
-      for (let attempt = 1; attempt <= REPEATS; attempt++) {
-        if (epoch !== attachedAt) {
-          attachedAt = epoch
-          let fresh
-          try {
-            fresh = await resume()
-          } catch (err) {
-            if (err instanceof Deferred) throw err
-            return sent ? unsure(`session.resume failed: ${failureOf(err).detail}`) : refuse(rpcRefusal(err, 'resume_refused'))
-          }
-          const verdict = submitVerdict(fresh, expected, baseline, run.submission_id, tolerateOwn)
-          if (verdict.adopt) return running(verdict.adopt, verdict.status)
-          if (verdict.unclear) return sent ? unsure(verdict.unclear) : refuse({ reason: 'toolsets_not_checkable', detail: verdict.unclear })
-          if (!verdict.check.ok) return refuse(verdict.check.refusal)
-        }
-        sent = true
-        try {
-          const admitted = await rpc(route, 'prompt.submit', {
-            session_id: sessionId, text: run.prompt_text, submission_id: run.submission_id
-          })
-          const adm = admitted && admitted.admission_id
-          if (typeof adm !== 'string' || !adm) throw new Deferred('prompt.submit answered without an admission_id')
-          return running(adm, admitted.status)
-        } catch (err) {
-          if (err instanceof Deferred || (err && err.guard)) throw err
-          if (isRpcError(err) && err.code !== 5001) return refuse(rpcRefusal(err, 'submit_refused'))
-          last = err
-          if (attempt < REPEATS) await wait(1000 * attempt)
-        }
-      }
-      throw new Deferred(`prompt.submit: no reply after ${REPEATS} attempts (${(last && last.message) || last})`)
-    } finally {
+    let info = null
+    let snap = null
+    let attachedAt = epoch
+    let sent = state === 'submit_requested' // an earlier claim may have sent the submit
+    if (state === 'waiting_for_gui') {
+      await step(runId, 'create_requested', { identity })
+      state = 'create_requested'
+    }
+    if (state === 'create_requested') {
+      let created
+      attachedAt = epoch
       try {
-        release()
+        created = await rpcRepeat(route, 'session.create', run.create_params)
       } catch (err) {
-        log('verksted: route release failed', err)
+        if (err instanceof Deferred) throw err
+        return refuse(err && err.guard ? { reason: 'bad_create_params', detail: err.message } : rpcRefusal(err, 'create_refused'))
+      }
+      sessionId = created && created.session_id
+      if (typeof sessionId !== 'string' || !sessionId) {
+        return refuse({ reason: 'create_refused', detail: 'session.create answered without a session_id' })
+      }
+      info = created.info || null
+      await step(runId, 'session_created', {
+        identity, session_id: sessionId,
+        ...(info && Array.isArray(info.enabled_toolsets) ? { enabled_toolsets: info.enabled_toolsets } : {})
+      })
+      state = 'session_created'
+    } else {
+      // A new claim means a new socket: re-attach first (toolset-check.md §6 step 5).
+      attachedAt = epoch
+      try {
+        snap = await resume()
+        info = (snap && snap.info) || null
+      } catch (err) {
+        if (err instanceof Deferred) throw err
+        if (sent) return unsure(`session.resume failed: ${failureOf(err).detail}`)
+        return refuse(rpcRefusal(err, 'resume_refused'))
       }
     }
+
+    let baseline = Array.isArray(run.effective_toolsets) ? run.effective_toolsets : null
+    if (state === 'session_created') {
+      const first = checkInfo(info, expected, null, tolerateOwn)
+      if (!first.ok) return refuse(first.refusal)
+      let shown
+      try {
+        shown = await rpcRepeat(route, 'tools.show', { session_id: sessionId })
+      } catch (err) {
+        if (err instanceof Deferred) throw err
+        return refuse({ reason: 'toolsets_not_checkable', detail: `tools.show failed: ${failureOf(err).detail}` })
+      }
+      const total = shown && typeof shown.total === 'number' ? shown.total : null
+      if (total === null) return refuse({ reason: 'toolsets_not_checkable', detail: 'tools.show answered without a total' })
+      if (!first.effective.some(name => name !== OWN_TOOLSET)) {
+        // E = [] or a default case that reads empty: only tools.show tells apart "nothing
+        // selected" from an inventory that failed open (toolset-check.md §10 M2).
+        const why = onlyOwnTools(shown, tolerateOwn)
+        if (why) return refuse({ reason: 'toolsets_not_checkable', detail: why })
+      }
+      await step(runId, 'toolsets_checked', {
+        identity, enabled_toolsets: first.effective, check: { effective: first.effective, tools_total: total }
+      })
+      state = 'toolsets_checked'
+      baseline = first.effective
+    }
+
+    if (state === 'toolsets_checked') {
+      let again
+      try {
+        again = await rpcRepeat(route, 'session.info', { session_id: sessionId })
+      } catch (err) {
+        if (err instanceof Deferred) throw err
+        return refuse({ reason: 'toolsets_not_checkable', detail: `session.info failed: ${failureOf(err).detail}` })
+      }
+      const second = checkInfo(again, expected, baseline, tolerateOwn)
+      if (!second.ok) return refuse(second.refusal)
+      await step(runId, 'submit_requested', { identity })
+      state = 'submit_requested'
+    } else if (state === 'send_waiting') {
+      // A follow-up turn (toolset-check.md §6 step 6): the re-attached session is checked again. It
+      // ran a turn before, so `lazy` may be false; the default case refuses a set that grew (D1).
+      const check = checkInfo(info, expected, baseline, tolerateOwn, { lazyRelaxed: true })
+      if (!check.ok) return refuse(check.refusal)
+      await step(runId, 'submit_requested', { identity })
+      state = 'submit_requested'
+    } else if (state === 'submit_requested') {
+      // Reconciling an unconfirmed submit: decide from the fresh snapshot, never repeat blindly.
+      const verdict = submitVerdict(snap, expected, baseline, run.submission_id, tolerateOwn)
+      if (verdict.adopt) return running(verdict.adopt, verdict.status)
+      if (verdict.unclear) return unsure(verdict.unclear)
+      // A session that never ran a turn admitted nothing: a failed check is a refusal, and a stored
+      // stop needs no Hermes. Otherwise our turn may have run already: a failed check is unclear.
+      if (!verdict.check.ok) return verdict.lazy ? refuse(verdict.check.refusal) : unsure(verdict.check.refusal.detail)
+      if (verdict.lazy && run.cancel_requested) {
+        await step(runId, 'cancelled', { reason: 'never_admitted' })
+        return { running: false }
+      }
+    }
+
+    // prompt.submit, repeated identically after a lost reply. A reconnect since the session was
+    // attached is answered by re-attaching here, seen, and deciding again from that snapshot.
+    let last = null
+    for (let attempt = 1; attempt <= REPEATS; attempt++) {
+      if (epoch !== attachedAt) {
+        attachedAt = epoch
+        let fresh
+        try {
+          fresh = await resume()
+        } catch (err) {
+          if (err instanceof Deferred) throw err
+          return sent ? unsure(`session.resume failed: ${failureOf(err).detail}`) : refuse(rpcRefusal(err, 'resume_refused'))
+        }
+        const verdict = submitVerdict(fresh, expected, baseline, run.submission_id, tolerateOwn)
+        if (verdict.adopt) return running(verdict.adopt, verdict.status)
+        if (verdict.unclear) return sent ? unsure(verdict.unclear) : refuse({ reason: 'toolsets_not_checkable', detail: verdict.unclear })
+        if (!verdict.check.ok) return sent ? unsure(verdict.check.refusal.detail) : refuse(verdict.check.refusal)
+      }
+      sent = true
+      try {
+        const admitted = await rpc(route, 'prompt.submit', {
+          session_id: sessionId, text: run.prompt_text, submission_id: run.submission_id
+        })
+        const adm = admitted && admitted.admission_id
+        if (typeof adm !== 'string' || !adm) throw new Deferred('prompt.submit answered without an admission_id')
+        return running(adm, admitted.status)
+      } catch (err) {
+        if (err instanceof Deferred || (err && err.guard)) throw err
+        if (isRpcError(err) && err.code !== 5001) return refuse(rpcRefusal(err, 'submit_refused'))
+        last = err
+        if (attempt < REPEATS) await wait(1000 * attempt)
+      }
+    }
+    throw new Deferred(`prompt.submit: no reply after ${REPEATS} attempts (${(last && last.message) || last})`)
   }
 
   // -- claim one run ------------------------------------------------------------------------
@@ -484,11 +577,13 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
     const wanted = typeof summary.session_profile === 'string' && summary.session_profile ? summary.session_profile : active.profile
     const route = wanted === active.profile ? active : pickRoute(routes, { connectionId: active.connectionId, profile: wanted })
     const stored = summary.identity || {}
-    if (summary.state === 'running' && stored.connection_id && !(route && sameIdentity(stored, {
+    // A running child, or a follow-up for one, belongs to the connection its session was created on.
+    // Only the connection is compared here; the profile and the principal are known after the claim.
+    if ((summary.state === 'running' || summary.state === 'send_waiting') && stored.connection_id && !(route && sameIdentity(stored, {
       connection_id: route.connectionId, route_profile: route.profile, target_profile: route.targetProfile,
-      profile_id: stored.profile_id
+      profile_id: stored.profile_id, subject: stored.subject
     }))) {
-      return // a running child of another connection: left to that connection (k8 decides takeovers)
+      return // a child of another connection: left to a window of that connection
     }
 
     let describe = null
@@ -545,12 +640,29 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
         }
         return
       }
+      if (run.state === 'send_waiting' && !sameIdentity(run.identity, identity)) {
+        await step(runId, 'refused', {
+          reason: 'identity_changed',
+          detail: 'the child session was created under another connection identity; a follow-up is sent only under that one'
+        })
+        return
+      }
+      // The retain lasts until the run is final or this window lets it go: it keeps a secondary
+      // route's socket open and the child attached to it as a viewer, so a Rückfrage of the child
+      // has someone to wait for (card k8, P5) and tracking dials no socket per tick (audit 9d).
+      const h0 = held.get(runId)
+      h0.release = await host.retainProfile(route)
+      h0.cancelRequested = run.cancel_requested === true
       let outcome
       try {
         outcome = await drive(runId, run, route, identity)
       } catch (err) {
         if (err instanceof StepRefused && err.code === 'identity_mismatch') {
           await step(runId, 'unknown', { reason: 'identity_changed', detail: err.message }).catch(() => {})
+          return
+        }
+        if (err instanceof StepRefused && MOVED_ON.includes(err.code)) {
+          log('verksted: run moved on without this window', runId, err.code)
           return
         }
         throw err
@@ -568,16 +680,30 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
   }
 
   // -- follow a running run -----------------------------------------------------------------
+  // A stop the tool stored, asked of Hermes once for our own admission. Only the terminal receipt
+  // that follows says whether it came in time; a draining gateway or a lost reply asks again.
+  async function sendCancel(h) {
+    try {
+      await rpc(h.route, 'prompt.cancel', { session_id: h.sessionId, admission_id: h.admissionId })
+      h.cancelSent = true
+    } catch (err) {
+      if (isTransient(err)) return
+      h.cancelSent = true // unknown_execution and other refusals: the receipt tells what became of the turn
+      log('verksted: prompt.cancel refused', failureOf(err))
+    }
+  }
+
   async function track(runId) {
     const h = held.get(runId)
     if (!h || !h.tracking || h.busy) return
     h.busy = true
     try {
+      if (h.cancelRequested && !h.cancelSent) await sendCancel(h)
       let receipt
       try {
         receipt = await rpc(h.route, 'prompt.receipt', { session_id: h.sessionId, admission_id: h.admissionId })
       } catch (err) {
-        if (!isRpcError(err)) return
+        if (isTransient(err)) return // draining, storage or no reply: not a reason to give the run up
         h.failures += 1
         if (h.failures >= 3) {
           await step(runId, 'unknown', { reason: 'receipt_refused', detail: failureOf(err).detail })
@@ -591,10 +717,14 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
         const full = await rpc(h.route, 'prompt.receipt', {
           session_id: h.sessionId, admission_id: h.admissionId, include_result: true
         })
+        const result = (full && full.result && typeof full.result === 'object') ? full.result : {}
+        // The plugin API checks the closing result block of final_response (card k10); this part
+        // sends the answer and what went unanswered, never a list of outputs of its own.
         await step(runId, 'finished', {
           identity: h.identity,
           outcome: (full && full.outcome) || receipt.outcome || 'terminal',
-          final_response: (full && full.result && full.result.final_response) || ''
+          final_response: typeof result.final_response === 'string' ? result.final_response : '',
+          ...resultNotes(result)
         })
         await letGo(runId)
         return
@@ -657,7 +787,15 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
   async function refreshView() {
     try {
       const all = await api('/runs')
-      if (all && all.ok === true) publish({ runs: all.runs || [], profileHome: all.profile_home || null, updatedAt: now() })
+      if (!all || all.ok !== true) return
+      publish({ runs: all.runs || [], profileHome: all.profile_home || null, updatedAt: now() })
+      // A stop for a run this window follows: ask Hermes now rather than on the next tick.
+      for (const run of all.runs || []) {
+        const h = held.get(run.run_id)
+        if (!h || !run.cancel_requested || h.cancelRequested) continue
+        h.cancelRequested = true
+        if (h.tracking) await track(run.run_id)
+      }
     } catch (err) {
       log('verksted: list failed', err)
     }
@@ -688,7 +826,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
       try {
         const answer = await api(`/runs/${enc(runId)}/renew`, { owner, generation: h.generation, lease_s: LEASE_S })
         if (!answer || answer.ok !== true) {
-          if (answer && CLAIM_GONE.includes(answer.code)) held.delete(runId)
+          if (answer && CLAIM_GONE.includes(answer.code)) drop(runId)
         }
       } catch (err) {
         log('verksted: renew failed', runId, err)
@@ -709,7 +847,15 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
   }
 
   function onGatewayEvent(event) {
-    if (event && event.type === 'gateway.ready') epoch += 1 // a (re)connected primary socket
+    if (event && event.type === 'gateway.ready') {
+      epoch += 1 // a (re)connected primary socket
+      // The new socket is attached to no child: re-attach every followed run now instead of on the
+      // next tick, so a Rückfrage asked in the gap finds a viewer (card k8, P5).
+      for (const [runId, h] of held) {
+        if (h.tracking) track(runId).then(refreshView)
+      }
+      return
+    }
     if (!event || typeof event.session_id !== 'string' || !event.session_id) return
     if (!/^(approval|clarify)\.(request|settled)$|^message\.complete$/.test(event.type || '')) return
     for (const [runId, h] of held) {
@@ -742,9 +888,13 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
       listeners.add(fn)
       return () => listeners.delete(fn)
     },
+    // The window goes away: give every claim back so another window can take over at once rather
+    // than after the lease. Best effort (the requests may not finish while the window unloads);
+    // never a stop — closing a window or tab does not end a run.
     dispose: () => {
       disposed = true
       listeners.clear()
+      return Promise.all([...held.keys()].map(runId => letGo(runId)))
     }
   }
 }
@@ -757,7 +907,21 @@ export function labelOf(run, now) {
   const prompts = run.state === 'running' && Array.isArray(run.prompts) ? run.prompts : []
   const waiting = prompts.length ? WAITING_LABELS[prompts[0].kind] : null
   const stale = STARTED.includes(run.state) && !(run.claim && run.claim.expires_at * 1000 > now)
-  return { text: waiting || LABELS[run.state] || run.state, waiting: !!waiting, stale }
+  const stopping = run.cancel_requested === true && !FINAL.includes(run.state)
+  return { text: waiting || (stopping ? STOPPING_LABEL : null) || LABELS[run.state] || run.state, waiting: !!waiting, stale }
+}
+
+/** The checked result of a finished run, line by line (card k10): what the child named and Verksted
+ *  found inside the workspace, what it named but was not there, what went unanswered. */
+export function resultLines(run) {
+  if (run.state !== 'finished') return []
+  const lines = []
+  if (run.result_block && run.result_block !== 'ok') lines.push(RESULT_BLOCK_LABELS[run.result_block] || run.result_block)
+  for (const o of Array.isArray(run.outputs) ? run.outputs : []) lines.push(`→ ${o.relative}${o.kind === 'folder' ? '/' : ''}`)
+  for (const m of Array.isArray(run.missing) ? run.missing : []) lines.push(`✗ ${m.path} (${m.reason})`)
+  for (const q of Array.isArray(run.unanswered) ? run.unanswered : []) lines.push(`Rückfrage ohne Antwort: ${q.question}`)
+  for (const b of Array.isArray(run.blocked) ? run.blocked : []) lines.push(`Nicht freigegeben: ${b.command}`)
+  return lines
 }
 
 function useView(worker) {
@@ -813,6 +977,8 @@ function RunRow({ run, worker, now }) {
   ]
   if (run.reason) children.push(h('div', { key: 'reason' }, `${run.reason}: ${run.detail || ''}`))
   if (run.result_preview) children.push(h('div', { key: 'result', className: 'whitespace-pre-wrap' }, run.result_preview))
+  const lines = resultLines(run)
+  if (lines.length) children.push(h('div', { key: 'outputs', className: 'text-(--ui-text-secondary)' }, ...lines.map((line, i) => h('div', { key: i }, line))))
   if (run.session_id) {
     children.push(h('button', {
       key: 'open', type: 'button', className: 'self-start rounded border px-2 py-0.5',

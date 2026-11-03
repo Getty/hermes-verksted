@@ -1,0 +1,4 @@
+# Verksted settings for every session started in this workspace or below it.
+# toolsets is the ceiling: a step folder may list fewer toolsets, never more.
+version: 1
+toolsets: [file, web, clarify]

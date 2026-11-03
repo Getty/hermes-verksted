@@ -7,3 +7,9 @@ Revision history for Verksted
     start steps; Desktop part that starts the run as a regular Hermes
     session after the toolset check and reports its result; make dev-env,
     make test, make doctor.
+  - bundled Hermes skill verksted:verksted (recognises a workspace, picks the
+    next workflow step, writes a self-contained task, reaches the tool
+    directly or via tool_search/tool_call, handles every run state;
+    questions and approvals stay with the user in the child's own chat);
+    demo workspace examples/verksted-demo/ with steps 10-research and
+    20-write.

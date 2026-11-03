@@ -1,0 +1,95 @@
+---
+claimed_at: 2026-11-03T19:34:24Z
+claimed_by: verksted-worker
+class: standard
+completed: 2026-11-03T19:34:24Z
+created: 2026-11-03T02:50:15Z
+depends_on:
+- 8
+id: 9
+priority: medium
+started: 2026-11-03T18:22:58Z
+status: done
+tags:
+- step-3
+- packaging
+title: 'Package: plugin.yaml, Python tool/state, skills/verksted, desktop/plugin.js,
+  dashboard manifest + plugin_api.py'
+updated: 2026-11-03T19:34:24Z
+---
+
+docs/architecture.md §7.3. One unified package; agent part and Desktop part both enabled. Record the supported Hermes Desktop/backend build. Lean profile check: unneeded MCP servers are not started.
+
+2026-11-03 17:37 Research (read-only, Hermes ad2b705 = v0.22.6-414, Linux; not exercised on Windows; full write-up in the k9 scratch design file of the orchestrator session).
+
+Install:
+- No archive or local-path install exists. Paths are 'hermes plugins install <git>#verksted --ref <sha>' (a /tree/<ref>/ URL ignores the ref), the Desktop 'Install plugin' dialog (installs AND enables both halves), or a manual copy plus plugins.enabled.
+- The agent half goes per profile into <home>/plugins/verksted. The Desktop half is app-level <root>/desktop-plugins/verksted (first home wins). It refreshes only when the source mtime is newer, so delete it on update.
+- The update path is 'install --force --ref'; 'plugins update' refuses (.git is dropped).
+- A dev-link symlink blocks install.
+- No manifest field is missing.
+
+[E] validate ok, doctor --ci ok. The security scan says caution sudo_usage at plugin.js:116 (comment). Rewording it gives safe (exercised), and avoids an 'Install anyway' prompt.
+
+[E] requires_hermes is enforced at install and load. ad2b705 reports 0.22.6, so >=0.22.6 is accurate. There is no Desktop-version field; record builds in a README table, in Changes and in windows-acceptance.
+
+[E] MCP (pinned gateway): enabled servers spawn at gateway start, before any session. enabled:false never spawns. toolsets [file] gets the MCP toolset appended (and the k3 check refuses). no_mcp drops the toolset but not the process. Lean profile = no enabled unneeded servers.
+
+Proposed:
+- plugin.js: reword the line-116 comment; the chip shows the API note / 404 'Agent-Teil nicht aktiviert'; guard host.profileRoutes.
+- A last_gui_poll in the meta table makes waiting_for_gui say 'Desktop part never polled'.
+- Makefile: 'package' (git archive zip, version + clean guards); 'install INSTALL_HOME=' copy with a .dev/ guard, link refusal and stale desktop-half removal.
+- README install / supported builds.
+- Tests: version sync, package contents, 2 MCP e2e tests with a stdlib fake stdio server.
+
+Audit blockers: Changes not stamped; Windows §7 not run; k8/k10 open; e2e not in make test. make test is green on c6be848 (190 + 58).
+
+2026-11-03 18:28 Worker start on e19d55b. Baseline scan of git archive HEAD:verksted (tools.plugin_guard.scan_plugin, Hermes ad2b705): caution, high sudo_usage at desktop/plugin.js:138 (comment), plus low findings (result.py hex regex, SKILL.md agent_config_ref) that do not change the verdict. Checked at ad2b705: host.profileRoutes/requestProfile (added 2026-08-14), host.openSession (2026-08-12) and host.retainProfile (2026-08-24, its doc says to feature-detect) are the host members an older Desktop may lack; navigate/notify date from the first SDK surface (2026-07-13). A plugin API that is not enabled answers 404 {detail: 'Plugin not found'} (web_server.py:435) or {detail: 'Not Found'} (hot-mount fallback); the renderer sees Error('404: <body>') through the preload sentinel (electron/api-expected-404.ts).
+
+2026-11-03 18:45 Decisions (mine, maintainer asleep):
+- Poll record: the Desktop sends GET /runs/claimable?owner=<window owner>. The route stores meta.last_gui_poll = {at, owner, subject} as one key/value row, so schema stays 2. An owner that is not 1-128 chars is stored as null. Recording is best-effort: a sqlite error is logged, and the list is still answered from the same store. A poll is not a claim. ctx.rest is profile-scoped, so a poll lands in the store of the profile the window shows.
+- Tool: waiting_for_gui and send_waiting carry desktop_last_poll_s (null = never). The hint says never polled / polled n ago / last poll n ago, so no window seems connected; freshness is 60 s (4x POLL_MS). Fail-closed stays: nothing is started or reclaimed because of the poll age. Hints stay English.
+- plugin.js: guarded host members are profileRoutes, requestProfile, retainProfile and openSession (added 2026-08-12..24 at ad2b705; navigate/notify predate them). If one is missing, the window does not poll; it shows 'Hermes Desktop zu alt für Verksted' and openSession notifies. A 404 (statusCode/status 404, or a message starting with '404' or 'Error: 404') gives 'Agent-Teil nicht aktiviert' plus the plugins.enabled hint. The chip order is waiting label, then note (clipped at 48 chars), then 'n aktiv'. The sudo comment is reworded.
+- Makefile install: copies git archive HEAD:verksted. On a dirty verksted/ it prints a note that it installs HEAD without the changes; it does not refuse. A home outside .dev/ needs I_MEAN_IT=1 (realpath -m, .dev itself refused). It refuses when plugins/verksted is a link and removes <home>/desktop-plugins/verksted. It writes config.yaml only when missing; an existing one is only checked, and a note is printed if verksted is not enabled. plugin-data and 'plugins enable' are never touched. package also refuses untracked files in verksted/. test-e2e is added, not run.
+
+Done on 990a5b5 + working tree (not committed).
+Verified:
+- make test: 258 pytest + 89 node, 0 skipped. make doctor OK.
+- Security scan (tools.plugin_guard.scan_plugin on a working-tree copy): safe, was caution sudo_usage. hermes plugins validate on the copy: ok, scan safe. Only warning: the known private imports at hermes_host.py:94,103.
+- install exercised: refused /tmp/x, .dev/../../x, .dev and the dev-link. A copy into .dev/home equals HEAD:verksted, 0 pyc; the stale desktop-plugins/verksted was removed; the dev-link was restored afterwards.
+- package exercised in a throwaway clone: dist/verksted-0.1.0.zip, 11 files under verksted/. Refused here: verksted/ is dirty. Refused in the clone: version skew and an untracked file.
+- Mutation check: removing the host guard, the 404 mapping, the chip note or the owner query each turns k9 tests red.
+SDK/gateway calls read at Hermes ad2b705 (v0.22.6-414), not exercised in a real Desktop. Not exercised on Windows. tests/e2e not run (orchestrator).
+Drift:
+- skills/verksted/SKILL.md waiting_for_gui row (~l.147) could name desktop_last_poll_s. Not edited, outside scope.
+- For a named-profile INSTALL_HOME the Desktop half lives in the root home and is not removed.
+- The e2e poll path is now /runs/claimable?owner=...; no e2e test asserts the path or the hint text.
+
+2026-11-03 18:53 Follow-up SKILL.md (worker, not committed).
+Description now: "Folder tasks and workflow steps in own sessions: run, track." (59 chars). It was "Run a task or workflow step in a workspace folder."
+Limits read at Hermes ad2b705, plus exercised through test_skill against the pinned Hermes:
+- The <available_skills> row is clipped to SKILL_PROMPT_DESC_LIMIT = 60 (agent/skill_utils.py:846). Plugin rows get the same clip (agent/prompt_builder.py:1214), at a word boundary plus "...".
+- skills_list and skill_view allow 1024 (tools/skills_tool_plugin.py:16).
+- skills/AGENTS.md hardline: <= 60, one sentence, ends with ".", no marketing words, no name or category repeat. The row prints category "plugin" and the name verksted:verksted.
+- No charset rule. The value stays double-quoted because it contains ": ".
+- __init__.py passes frontmatter["description"] unchanged; test_a_default_session_offers_the_skill asserts the unclipped row.
+Trade-off (mine): the brief asked for when + what + follow-ups. That does not fit in 60. Kept: folder, workflow step, own session, run/track. Dropped: continue/cancel; the name verksted covers "Verksted workspace".
+waiting_for_gui/send_waiting row and Prerequisites now use desktop_last_poll_s:
+- null: switch on the Verksted part (Capabilities → Plugins) and open this profile.
+- over 60: open Hermes Desktop on this profile.
+- 60 or less: ask nothing.
+- Then wait; never start or send again.
+At ad2b705 the Desktop part switch is app-wide (localStorage hermes.desktop.pluginDecisions.v2, contrib/plugins-store.ts:38), not per profile. The German UI label is Fähigkeiten ▸ Plugins.
+test_skill._result_views now passes a never-polled store stub, so the field check knows desktop_last_poll_s. A mutation (misspelled field) turns it red.
+make test: 258 pytest + 89 node, 0 skipped. tests/e2e not run. Not exercised on Windows.
+
+2026-11-03 19:22 Follow-up Makefile, dev-env commit-graph (worker, not committed).
+Cause (orchestrator's e2e finding): test_18 failed with 'Tool verksted does not exist'. The gateway had skipped the plugin: requires hermes >=0.22.6, running 0.21.5.
+Read at ad2b705, hermes_cli/version_info.py: _git_version_info runs git tag --merged HEAD through _run_git (timeout=3, l.64). On a timeout it falls back to _calver_release_version (0.21.5).
+Reproduced read-only: git -c core.commitGraph=false tag --merged HEAD took 2.07 s at load 4; with the graph it takes 0.08 s.
+Change: dev-env now runs git -C $(HERMES) commit-graph write --reachable --no-progress after the checkout, with a column-0 comment (make ignores it, nothing echoed).
+Exercised on the existing .dev/: make dev-env exit 0, 9 s, no clone. Unchanged: HEAD ad2b705, tree status, uv pip freeze hash, the dev-link, config.yaml. Only the graph's mtime changed. commit-graph verify ok.
+get_version_info(): 0.22.6 / 0.22.6+414.gad2b705 / source git.
+make test: 258 pytest + 89 node, 0 skipped. tests/e2e not run. A fresh clone was not exercised; its HEAD is reachable from refs/heads/main, so --reachable covers it.
+
+Committed as 1939137

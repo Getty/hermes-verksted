@@ -1,0 +1,34 @@
+---
+claimed_at: 2026-11-03T03:40:39Z
+claimed_by: verksted-worker-2
+class: standard
+completed: 2026-11-03T03:40:39Z
+created: 2026-11-03T02:50:07Z
+depends_on:
+- 1
+id: 2
+priority: high
+started: 2026-11-03T03:11:49Z
+status: done
+tags:
+- step-1
+- toolsets
+title: Decide whether the effective tool set is checkable before the first prompt
+updated: 2026-11-03T05:36:26Z
+---
+
+docs/architecture.md §3 and §7.1: Verksted must verify the effective tools of a new session before prompt.submit and refuse the start when they exceed the ceiling or cannot be checked. Find out on the target build whether that is possible through the public interfaces. If not, scope the small Hermes session-policy extension (visibility and execution) as an explicit precursor — a proposal for the maintainer, not a fork.
+
+2026-11-03 03:12 Started: reading Hermes ad2b705 sources (session_policy, tools_config, toolsets, model_tools, tui_gateway session methods/contracts) for an effective-toolset readout before prompt.submit.
+
+2026-11-03 03:25 Findings (ad2b705, in-process AuthorityConnection harness against throwaway HERMES_HOME .dev/home-k2): session.create reply info.enabled_toolsets (= session.info) is the frozen policy toolset set the first turn builds from, AFTER plugin/MCP/x_search/context_engine fold-in. Explicit list is NOT exact: every enabled MCP server rides in unless 'no_mcp' or an explicit server is named; every plugin toolset rides in unless declined in profile known_plugin_toolsets.cli. [] is not empty (MCP+plugins); ['no_mcp'] is truly empty only with all plugin toolsets declined. Unknown/disabled-MCP names -> invalid_params field=toolsets. session.resume from a fresh client re-derives MCP servers (and the whole set without explicit toolsets); revision does not move. info.tools hides deferred plugin/MCP tools behind tool_search; tools.show lists them. Inventory failure reports enabled_toolsets=[] (fail-open) -> must cross-check.
+
+Verdict (docs/toolset-check.md, Hermes ad2b705 + v0.22.6, harness on Linux, not exercised on Windows/GUI): checkable at TOOLSET level via public interfaces, no Hermes extension needed for v1. Read info.enabled_toolsets from the session.create reply (= session.info, effective after plugin/MCP/context_engine/x_search fold-in; same builder as the first turn; dispatch gated on it). Request shape: explicit list + 'no_mcp', never follow_profile_config -> no refresh path (resume CFG-2, reload.mcp, implicit client resume) can add a toolset. Check: lazy==true, desktop_protocol hermes-gateway-v1, set(enabled_toolsets)==requested exactly, tools.show ok (total 0 when empty); re-read session.info right before prompt.submit and after every resume. Exact tool-name allowlist not checkable (v1 boundary). Maintainer decisions: D1 default case (no list) is not pinnable -> proposed: require a list under a ceiling; M2 Hermes adds every undeclined plugin toolset incl. verksted itself -> refuse unless known_plugin_toolsets.cli saved or listed; M3 MCP servers in lists. Drift (k1): SDK rewrites source to 'gui' — same results for explicit lists, default adds project/desktop_ui/catalog.
+
+Checkable at toolset level with public interfaces (explicit list + no_mcp, exact match on create-reply info.enabled_toolsets, re-read before submit); needs maintainer decisions D1 default case, M2 plugin-toolset fold-in, M3 MCP in lists — see docs/toolset-check.md
+
+2026-11-03 03:39 Orchestrator decisions for v1 (pending maintainer review), recorded in docs/toolset-check.md §10: D1=(a) explicit list under a ceiling; M2=tolerate verksted's own toolset + recursion guard, other plugin toolsets refused as exceeded; M3=always no_mcp in explicit lists; C2 gate accepted; C1 accepted.
+
+2026-11-03 03:40 Committed as 4c33701. Moving to done although k2 depends on k1: the source-side verdict does not depend on the Windows build record. Section 10 decisions are pending maintainer review.
+
+2026-11-03 05:36 Doc corrections after the k3 audit committed as 409221c (docs/toolset-check.md section 11, docs/hermes-interfaces.md)

@@ -1,0 +1,32 @@
+---
+claimed_at: 2026-11-03T05:36:23Z
+claimed_by: verksted-test-writer
+class: standard
+created: 2026-11-03T02:50:09Z
+depends_on:
+- 3
+id: 4
+priority: high
+started: 2026-11-03T03:41:13Z
+status: review
+tags:
+- step-1
+- acceptance
+title: 'Prototype acceptance: Rückfrage and denied approval via the native child chat;
+  result and resume reach the same parent'
+updated: 2026-11-03T05:36:23Z
+---
+
+docs/architecture.md §5 and §7.1. A free-text question and a denied tool approval must work through Session öffnen into the native child chat; the denied action is not executed. Result and resume reach the same parent binding. Run on Windows. Only after this passes are further features added.
+
+2026-11-03 03:55 Phase 1 started: harness in tests/e2e/ (vk_e2e python pkg, shim/ node Desktop-window stand-in, fixtures/e2eprobe). Backend started via 'hermes gateway ensure --json' as Electron main does; tickets minted over <home>/gateway.sock. Finding while reading the Desktop client: it sends client.capabilities{server_requests:true} on gateway.ready and then adds clarify_batch:true to EVERY prompt.submit (api/client.ts:430) - so a Rueckfrage in a Verksted child arrives as a server request 'clarify' (srq- id), not a clarify.request event, and is lost ('cancelled') if no viewer socket is attached. Verifying in the smoke run.
+
+2026-11-03 04:15 Phase 1 done (stays in-progress for phase 2). Harness: tests/e2e/ - run: .dev/venv/bin/python -m pytest tests/e2e -v (15 passed, 0 skipped, ~75 s, no process left, ~/.hermes untouched). Real: pinned Hermes via 'hermes gateway ensure --json' from a throwaway home under .dev/e2e, canonical ws + native-http auth, plugin API. Faked: Desktop renderer (Node shim tests/e2e/shim/window.mjs, header lists everything). Findings: (1) Desktop client adds clarify_batch:true to every prompt.submit -> a Rueckfrage is a server request (srq-), shown in resume open_requests, NOT in prompts[]; with no viewer attached it is NOT parked: clarify tool gets 'unanswered', turn completes. (2) plugin tools are deferred behind tool_search by default (tools.tool_search.enabled auto): a plugin tool is not in the model-facing array. Both pinned as characterization tests.
+
+2026-11-03 04:16 Orchestrator: phase 1 (harness in tests/e2e/, 15 passed) reviewed; findings 1-3 (clarify_batch → open_requests, Rückfrage lost without viewer, plugin tools deferred behind tool_search) forwarded to the k3 worker. Phase 2 starts after k3 lands.
+
+2026-11-03 04:43 Phase 2 done, LINUX STAND-IN ONLY. tests/e2e: 25 passed, 0 skipped, 0 xfail (harness smoke 15 + real verksted package 10: happy path, Rueckfrage, denied approval, same-parent result after new window, running-run takeover, toolset refusal + allowed case, describe gate, lost create reply, tool_search path). make test green (agent pytest + 40 node). docs/windows-acceptance.md holds the manual scenarios A-F. THE WINDOWS RUN IS STILL OUTSTANDING and is the card's real acceptance (arch 7.1: Rueckfrage + denied approval via Session oeffnen in the native chat on Windows Desktop, result+resume to same parent, folder with space/umlaut, no console window). Not exercised on Windows; Desktop renderer is a Node shim; build tested: Hermes ad2b705.
+
+2026-11-03 05:34 Orchestrator: after the k3 fix pass the e2e suite ran 27/27 green four times (worker 2x, orchestrator 2x: 314 s, 229 s). One earlier full run by the fix worker failed tests 1-7 quickly (~30 s each) and was interrupted before tracebacks; not reproduced. Open observation: watch for it on the next runs (possible cause named by the worker: gateway.ready arriving after the first create adds a resume before submit and breaks test_1's exact-order assertion).
+
+2026-11-03 05:36 Committed as 6cda781 (Linux stand-ins: real Hermes ad2b705 backend, Node shim for the Desktop renderer). Stays in review: acceptance is the Windows run, docs/windows-acceptance.md. Warning about dependency on k1 (blocked on the Windows run) expected.

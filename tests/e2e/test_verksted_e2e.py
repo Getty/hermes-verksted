@@ -401,3 +401,33 @@ def test_10_an_empty_toolset_list_runs_with_verksted_own_tool_only(e2e):
     assert set(out["effective_toolsets"] or []) <= {"verksted"}, out
     child = [r for r in env.model.requests if "CHILD_EMPTY" in r["user"]]
     assert child and set(child[0]["tools"]) <= {"verksted"}, child[:1]
+
+
+# 11 -----------------------------------------------------------------------------------------------------
+def test_11_a_step_folder_inherits_the_workspace_list_and_cannot_widen_it(env):
+    # k5 through the real backend: the walk from the topmost .verksted.yaml down to the step folder;
+    # the inherited list is what session.create carries, a widening list is refused by the tool.
+    win = env.window("verksted")
+    root = folder_for(env, "inherit")
+    (root / ".verksted.yaml").write_text("version: 1\ntoolsets: [file, e2eprobe]\n", encoding="utf-8")
+    step = root / "workflow" / "10-step"
+    step.mkdir(parents=True, exist_ok=True)
+    env.model.when("CHILD_INH", WriteFile(str(step / "inh.txt"), "inherited"), Final("inherited run done"))
+    parent_run(env, "INH", step, "CHILD_INH write inh.txt")
+    psid, adm = parent_turn(env, win, "PARENT_INH go", "inh")
+    out = tool_result(_terminal(win, psid, adm))
+    assert out["state"] == "finished" and out["outcome"] == "completed", out
+    assert (step / "inh.txt").read_text() == "inherited"
+    assert out["config"]["workspace"] == str(root) and out["config"]["toolsets"] == ["file", "e2eprobe"]
+    assert [f["path"] for f in out["config"]["files"]] == [str(root / ".verksted.yaml")]
+    create = [c for c in win.rpc_calls("session.create") if c["params_in"].get("cwd") == str(step)]
+    assert create and create[0]["params_wire"]["toolsets"] == ["file", "e2eprobe", "no_mcp"], create
+
+    wide = root / "workflow" / "20-wide"
+    wide.mkdir(parents=True, exist_ok=True)
+    (wide / ".verksted.yaml").write_text("toolsets: [file, terminal]\n", encoding="utf-8")
+    parent_run(env, "WIDE", wide, "CHILD_WIDE never", wait=0)
+    psid2, adm2 = parent_turn(env, win, "PARENT_WIDE go", "wide")
+    refused = tool_result(_terminal(win, psid2, adm2))
+    assert refused["ok"] is False and refused["error"]["code"] == "toolsets_widen", refused
+    assert not store_rows(env, "SELECT run_id FROM runs WHERE target_dir=?", str(wide))

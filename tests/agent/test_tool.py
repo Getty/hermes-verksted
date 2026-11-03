@@ -7,7 +7,8 @@ import sqlite3
 
 import pytest
 
-from verksted import tool
+from fakefs import WinFS
+from verksted import paths, tool
 from verksted.store import Store
 
 PRINCIPAL = {"subject": "user-1"}
@@ -32,6 +33,9 @@ class FakeHost:
         self.yield_after = None  # a mid-turn user message: Hermes asks the tool thread to yield
         self.on_sleep = None
         self.kwargs_seen = []
+        self.plugin_settings = {}  # plugins.entries.verksted.settings of the calling profile
+        self.profiles = {}         # live profiles next to the caller: name -> home
+        self.path_backend = paths.Backend()
 
     def caller(self, kwargs):
         self.kwargs_seen.append(dict(kwargs))
@@ -50,6 +54,15 @@ class FakeHost:
                     return counted
                 return attr
         return Counting()
+
+    def settings(self):
+        return dict(self.plugin_settings)
+
+    def profile_home(self, name):
+        return self.profiles.get(name)
+
+    def backend(self):
+        return self.path_backend
 
     def ring(self):
         self.rings += 1
@@ -195,6 +208,62 @@ def test_a_second_run_in_the_same_folder_is_refused(host, workspace, tmp_path):
     assert run_now(host, link)["error"]["code"] == "folder_busy"
 
 
+def test_win_one_active_run_per_folder_whatever_the_spelling(host):
+    """Simulated with ntpath — not exercised on Windows (k6)."""
+    fs = WinFS()
+    fs.mkdir("C:\\Work")
+    fs.link("C:\\Elsewhere\\into", "C:\\Work")
+    host.path_backend = fs.backend()
+    first = run_now(host, "C:\\Work")
+    run = host.store_obj.get_run(first["handle"])
+    assert run["target_dir"] == "C:\\Work" and run["target_key"] == "c:\\work"
+    assert run["create_params"]["cwd"] == "C:\\Work"
+    for spelling in ("c:\\work\\", "C:/WORK", "\\\\?\\C:\\Work", "C:\\Elsewhere\\into"):
+        assert run_now(host, spelling)["error"]["code"] == "folder_busy", spelling
+
+
+def test_status_shows_the_frozen_config_and_ignores_later_file_changes(host, workspace):
+    path = workspace / ".verksted.yaml"
+    path.write_text("toolsets: [file, web]\n")
+    out = run_now(host, workspace)
+    stored = host.store_obj.get_run(out["handle"])
+    assert out["config"] == {"workspace": str(workspace), "toolsets": ["file", "web"],
+                             "ceilings": [{"source": str(path), "toolsets": ["file", "web"]}],
+                             "files": stored["resolved_config"]["files"], "profile_switched": False,
+                             "fingerprint": stored["config_fingerprint"]}
+    path.write_text("toolsets: [terminal]\n")  # a later edit does not reach a stored run
+    status = call(host, {"action": "status", "handle": out["handle"]})
+    assert status["config"] == out["config"] and status["toolsets"] == ["file", "web"]
+    assert host.store_obj.get_run(out["handle"])["create_params"]["toolsets"] == ["file", "web", "no_mcp"]
+
+
+def test_a_run_in_an_allowed_profile_keeps_the_parent_store_and_binding(host, workspace):
+    (workspace / ".verksted.yaml").write_text("profile: research\ntoolsets: [file]\n")
+    host.plugin_settings = {"allowed_profiles": ["research"]}
+    assert run_now(host, workspace)["error"]["code"] == "profile_missing"
+    host.profiles = {"research": "/homes/research"}
+    out = run_now(host, workspace)
+    assert out["ok"] and out["profile"] == "research" and out["config"]["profile_switched"] is True
+    run = host.store_obj.get_run(out["handle"])  # the parent's store, the parent's binding
+    assert run["parent_profile"] == "default" and run["parent_profile_home"] == "/homes/default"
+    assert run["resolved_config"]["profile_home"] == "/homes/research"
+    assert call(host, {"action": "status", "handle": out["handle"]})["profile"] == "research"
+
+
+def test_registered_workspaces_come_from_the_plugin_settings(host, workspace, tmp_path):
+    host.plugin_settings = {"workspaces": [str(workspace)]}
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    out = run_now(host, elsewhere)
+    assert out["error"]["code"] == "not_in_workspace" and host.store_obj.list_runs() == []
+    # A link inside the workspace that points out of it is the folder it points to: refused too.
+    (workspace / "out").symlink_to(elsewhere)
+    assert run_now(host, workspace / "out")["error"]["code"] == "not_in_workspace"
+    assert host.store_obj.list_runs() == []
+    host.plugin_settings = {"workspaces": "not a list"}
+    assert run_now(host, workspace)["error"]["code"] == "bad_settings"
+
+
 def test_send_and_cancel_are_not_in_this_build(host):
     for action in ("send", "cancel"):
         out = call(host, {"action": action, "handle": "vk-x"})
@@ -205,7 +274,7 @@ def test_bad_folder_and_config_answer_structured_errors(host, workspace, tmp_pat
     assert call(host, {"action": "run", "folder": "rel", "task": "x"})["error"]["code"] == "bad_folder"
     (workspace / ".verksted.yaml").write_text("profile: elsewhere\n")
     out = call(host, {"action": "run", "folder": str(workspace), "task": "x"})
-    assert out["error"]["code"] == "profile_switch_unsupported"
+    assert out["error"]["code"] == "profile_not_allowed"  # k5: switching exists, only to allowed profiles
     assert call(host, {"action": "run", "folder": str(tmp_path), "task": "  "})["error"]["code"] == "bad_args"
 
 

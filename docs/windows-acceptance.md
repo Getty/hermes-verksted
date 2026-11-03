@@ -161,7 +161,130 @@ Start each scenario in a fresh parent chat of the Desktop (the "parent").
   toolset in the file lets the run proceed. The describe gate (`legacy_route`) needs a gateway
   without `durable-admission-v1`; not reproducible on this build, record "not run".
 
+## Path checks on the executing backend (k6)
+
+Scenarios G–K check `docs/architecture.md` §6 "Pfade werden auf dem ausführenden Backend
+validiert: Laufwerksbuchstaben, Leerzeichen, Unicode und Junctions ... Bei einem WSL-Backend gilt
+dessen Pfadraum". §7 has no row of its own for these; each names the row it is part of. Their
+Linux stand-ins in `tests/agent/test_paths.py` and `tests/agent/test_tool.py` (`test_win_*`) run
+the rules with `ntpath` and a filesystem stub — simulated, not exercised on Windows. Here the real
+`realpath` (`GetFinalPathNameByHandle`) decides.
+
+**Preconditions:** §0 with the package of k5/k6 or later. Every result below is the tool result
+the parent reports; ask for it verbatim (*"... and show me the tool's JSON result"*). A refusal is
+`ok: false` with `error.code`; an accepted run shows the stored path in `folder`. In every scenario
+no console window may appear. For the slow runs use the task *"run `ping -n 60 127.0.0.1`, then
+write `slow.txt`"* with `wait_seconds: 0`.
+
+### G Drive-letter case and spelling are one folder
+
+- **§7 row:** "Windows-Ordner mit Leerzeichen und Umlaut" (which folder the run is in); also §4
+  "Schreibende Läufe im selben Arbeitsordner werden im MVP serialisiert".
+- **Linux stand-in:** `test_win_drive_letter_case_and_trailing_separator_are_the_same_folder`,
+  `test_win_one_active_run_per_folder_whatever_the_spelling`.
+- **Steps:**
+  1. Start a slow run in `C:\verksted k4\Ärger\work`. Note its `handle` and `folder`.
+  2. While it runs, same parent: run in `c:\VERKSTED K4\ärger\WORK\` (lower-case drive, other
+     case, trailing backslash), task *"write `x.txt`"*.
+  3. After the first run is `fertig`, repeat step 2.
+- **Expected:** step 1 `folder` is `C:\verksted k4\Ärger\work` exactly (true case, no trailing
+  backslash). Step 2 is refused `folder_busy` and carries the first run's `handle`; no second
+  child session exists. Step 3 is accepted and its `folder` is again `C:\verksted k4\Ärger\work`,
+  not the spelling that was typed.
+
+### H Space and umlaut stay byte-exact, files stay inside
+
+- **§7 row:** "Windows-Ordner mit Leerzeichen und Umlaut" (the file part); scenario A covers the
+  file operation itself.
+- **Linux stand-in:** `test_win_space_and_umlaut_are_kept_exactly`,
+  `test_a_folder_with_space_and_umlaut_keeps_its_bytes`, `test_win_files_stay_inside_the_folder`.
+- **Steps:**
+  1. Create `C:\verksted k4\Ärger\work\Notiz ü.md` with one line of text.
+  2. Run in `C:\verksted k4\Ärger\work` with `files: ["Notiz ü.md"]`, task *"quote the first line
+     of the listed file"*.
+  3. Run there with `files: ["..\work2\x.md"]`, then with
+     `files: ["C:\verksted k4\Ärger\work\Notiz ü.md"]`.
+- **Expected:** step 2: the prompt in the child chat ends with the list item `- Notiz ü.md`, the
+  child quotes the line, and the Verksted page shows folder and file names without mojibake.
+  Step 3: both refused `bad_files` (leaves the folder / not relative); nothing is stored.
+
+### I Junctions into and out of the workspace
+
+- **§7 row:** "Windows-Ordner mit Leerzeichen und Umlaut" (which folder the run is in); §2 "vom
+  registrierten Arbeitsbereich bis zum Zielordner".
+- **Linux stand-in:** `test_win_short_names_and_junctions_resolve_to_the_real_folder`,
+  `test_files_that_leave_the_folder_through_a_symlink_are_refused`,
+  `test_registered_workspaces_come_from_the_plugin_settings` (symlink as stand-in for a junction).
+- **Steps** (PowerShell):
+  1. ```powershell
+     New-Item -ItemType Directory 'C:\verksted-k4-outside' | Out-Null
+     Set-Content 'C:\verksted-k4-outside\secret.txt' 'secret'
+     New-Item -ItemType Junction -Path 'C:\verksted k4\Ärger\work\out' -Target 'C:\verksted-k4-outside'
+     New-Item -ItemType Junction -Path 'C:\verksted k4\link-in' -Target 'C:\verksted k4\Ärger\work'
+     ```
+  2. Start a slow run with folder `C:\verksted k4\link-in`. While it runs, run in
+     `C:\verksted k4\Ärger\work`.
+  3. After it finished: run in `C:\verksted k4\Ärger\work` with `files: ["out\secret.txt"]`.
+  4. Put `.verksted.yaml` with `version: 1` and `toolsets: [file]` into `C:\verksted k4\`. Run
+     with folder `C:\verksted k4\Ärger\work\out`.
+  5. Register the workspace: Desktop Settings → Plugins → Verksted → `workspaces`
+     `["C:\\verksted k4"]` (or in `config.yaml`: `plugins.entries.verksted.settings.workspaces:
+     ['C:\verksted k4']`), restart the gateway, repeat step 4.
+  6. Clean up: remove the registration, the `.verksted.yaml` of step 4 and both junctions
+     (`Remove-Item` on the junction, never on its target's contents).
+- **Expected:** step 2: the first run's `folder` is `C:\verksted k4\Ärger\work`; the second is
+  refused `folder_busy`. Step 3: refused `bad_files`. Step 4 (unregistered): accepted with `folder`
+  `C:\verksted-k4-outside` and `config.workspace` `C:\verksted-k4-outside`, `config.files` empty —
+  the `[file]` list of `C:\verksted k4` does **not** apply, because the run is in the junction's
+  target. That is the documented limit without registration (k5); note it, it is not a failure.
+  Step 5: refused `not_in_workspace`; nothing is stored.
+
+### J The `\\?\` prefix and long paths
+
+- **§7 row:** "Windows-Ordner mit Leerzeichen und Umlaut" (which folder the run is in); §7
+  "Umfang von Version 1: lokale Arbeitsordner" (UNC and device paths are refused).
+- **Linux stand-in:** `test_win_long_path_prefix_is_accepted_and_stored_plain`,
+  `test_win_paths_outside_v1_are_refused`.
+- **Steps:**
+  1. Record `(Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem).LongPathsEnabled`.
+  2. Run with folder `\\?\C:\verksted k4\Ärger\work`.
+  3. Create a folder longer than 260 characters:
+     `New-Item -ItemType Directory -Path ('\\?\C:\verksted k4\long\' + 'x'*120 + '\' + 'y'*120)`.
+     Run with that folder once with and once without the `\\?\` prefix.
+  4. Run with `\\localhost\C$\verksted k4\Ärger\work` and with `\\.\C:\verksted k4`.
+- **Expected:** step 2: accepted, `folder` is `C:\verksted k4\Ärger\work` without the prefix.
+  Step 3 with `LongPathsEnabled` 0: refused — `path_too_long` with the prefix, `folder_missing`
+  without; with 1: accepted with the plain path in `folder` — then also note whether the child
+  can write a file there (that is Hermes' tools, not Verksted's check). Step 4: refused
+  `unc_path` and `device_path`.
+
+### K A WSL backend given a `C:\` path
+
+- **§7 row:** "Windows-Ordner mit Leerzeichen und Umlaut" (the file lands in the right folder),
+  on a WSL backend; §6 "ein Windows-Pfad wird nicht ungeprüft dorthin weitergereicht".
+- **Linux stand-in:** `test_wsl_a_windows_drive_path_is_mapped_and_checked`,
+  `test_wsl_a_share_path_must_name_this_distro` (Hermes' `translate_cwd_for_wsl_backend` at
+  `ad2b705` with `is_wsl` patched — no real WSL).
+- **Needs** a Desktop connection to a backend inside WSL (`docs/hermes-interfaces.md` Windows
+  check §2.1: a `remote` or `ssh` gateway entry), the package installed in that backend's
+  `HERMES_HOME` as in §0.3, and the Desktop half enabled. Without one, record "not run". In the
+  distro, record `echo $WSL_DISTRO_NAME` and `mount | grep -E 'drvfs|9p'`.
+- **Steps:**
+  1. Run with folder `C:\verksted k4\Ärger\work`, task *"write `wsl.txt` containing the word
+     hallo"*.
+  2. Start a slow run there (the terminal is the distro's shell: `sleep 60` in place of `ping`);
+     while it runs, run in `c:\VERKSTED K4\ärger\work`.
+  3. In the distro `mkdir ~/verksted-k6`; run with folder
+     `\\wsl.localhost\<distro>\home\<user>\verksted-k6`, then with another distro name in place of
+     `<distro>`.
+  4. Run with `\\server\share\x`.
+- **Expected:** step 1: `folder` is `/mnt/c/verksted k4/Ärger/work`; `wsl.txt` appears in the
+  Windows folder. Step 2: refused `folder_busy` (if instead `folder_missing`, the drvfs mount is
+  case-sensitive — record the mount options). Step 3: the first is accepted with `folder`
+  `/home/<user>/verksted-k6`; the other distro name is refused `windows_path`. Step 4: refused
+  `windows_path`. No path reaches `session.create` in its Windows form.
+
 ## Not covered here
 
 Slim profiles and MCP (§7 "Schlankes Profil"), two simultaneous Rückfragen (k8), a gateway kill
-mid-action (k8), WSL path spaces (k6), Stop (`cancel`, not in this build). Those rows stay open.
+mid-action (k8), Stop (`cancel`, not in this build). Those rows stay open.

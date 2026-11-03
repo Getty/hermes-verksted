@@ -34,12 +34,25 @@ def test_real_hermes_loads_registers_and_invokes_the_plugin(hermes_ready, throwa
     home = throwaway_home("contract")
     workspace = home / "workspace ü"
     workspace.mkdir()
+    # k5: the calling profile's plugin settings and a second, allowed profile next to it.
+    research_home = home / "profiles" / "research"
+    research_home.mkdir(parents=True)
+    (research_home / "config.yaml").write_text("{}\n", encoding="utf-8")  # an identity marker
+    switched = home / "research ws"
+    switched.mkdir()
+    (switched / ".verksted.yaml").write_text("profile: research\ntoolsets: [file]\n", encoding="utf-8")
+    outside = tmp_path / "not registered"
+    outside.mkdir()
+    with (home / "config.yaml").open("a", encoding="utf-8") as fh:
+        fh.write(f"  entries:\n    verksted:\n      settings:\n        workspaces: [{json.dumps(str(home))}]\n"
+                 "        allowed_profiles: [research]\n")
+    extra = json.dumps({"switched": str(switched), "outside": str(outside), "research_home": str(research_home)})
     env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
     env.update(HERMES_HOME=str(home), HOME=str(home / "user"), TMPDIR=str(home / "tmp"))
     (home / "user").mkdir()
     (home / "tmp").mkdir()
     result = home / "probe-result.json"
-    proc = subprocess.run([str(VENV_PYTHON), PROBE, str(workspace), str(result)], cwd=str(HERMES_SRC), env=env,
+    proc = subprocess.run([str(VENV_PYTHON), PROBE, str(workspace), str(result), extra], cwd=str(HERMES_SRC), env=env,
                           capture_output=True, text=True, timeout=240)
     assert proc.returncode == 0 and result.is_file(), proc.stderr[-4000:]
     assert "predates version" not in proc.stderr, proc.stderr[-2000:]
@@ -55,6 +68,11 @@ def test_real_hermes_loads_registers_and_invokes_the_plugin(hermes_ready, throwa
     assert run["folder"] == str(workspace.resolve()) and run["profile"] == "default"
     assert out["status"]["ok"] and out["status"]["handle"] == run["handle"]
     assert out["busy"]["error"]["code"] == "folder_busy"
+    # k5 against the real ctx.get_config and hermes_constants profile helpers.
+    sw = out["switched"]
+    assert sw["ok"] and sw["profile"] == "research" and sw["config"]["profile_switched"] is True, sw
+    assert sw["config"]["workspace"] == str(home.resolve()) and sw["toolsets"] == ["file"]
+    assert out["outside"]["error"]["code"] == "not_in_workspace", out["outside"]
     assert out["deferrable"] is True  # ad2b705 has no registration option that keeps a plugin tool eager
     assert out["searched"]["results"][0]["matches"] == ["verksted"], out["searched"]
     assert out["searched"]["tools"]["verksted"]["source"] == "plugin"
@@ -62,7 +80,7 @@ def test_real_hermes_loads_registers_and_invokes_the_plugin(hermes_ready, throwa
     assert out["store_file"] is True
     # The doorbell: one plugin event per stored run, no run data in it.
     bells = [f for f in out["frames"] if "plugin.verksted.work" in json.dumps(f)]
-    assert len(bells) == 1, out["frames"]
+    assert len(bells) == 2, out["frames"]  # the run and the switched run
     assert run["handle"] not in json.dumps(bells)
 
     base = "/api/plugins/verksted"
@@ -72,9 +90,12 @@ def test_real_hermes_loads_registers_and_invokes_the_plugin(hermes_ready, throwa
     claimable = out["claimable"]
     assert claimable["status"] == 200 and claimable["body"]["ok"]
     assert claimable["body"]["profile_home"] == out["home"]
-    assert [r["run_id"] for r in claimable["body"]["runs"]] == [run["handle"]]
+    assert sorted(r["run_id"] for r in claimable["body"]["runs"]) == sorted([run["handle"], sw["handle"]])
     assert out["claim"] == {"ok": True, "generation": 1, "mode": "start", "code": None}
     assert {"create_params", "prompt_text", "request_id", "submission_id"} <= set(out["claim_run_keys"])
     assert out["step"]["ok"] and out["step"]["run"]["state"] == "create_requested"
     assert out["stale"] == {**out["stale"], "ok": False, "code": "stale_generation"}
     assert out["mismatch"]["code"] == "profile_mismatch"
+    assert out["switched_parent_route"]["code"] == "profile_mismatch", out["switched_parent_route"]
+    assert out["switched_claim"] == {"ok": True, "code": None, "session_profile": "research",
+                                     "own_toolset_tolerated": False}

@@ -10,16 +10,26 @@ Interfaces read at Hermes ad2b705 (docs/hermes-interfaces.md §4):
 - ``ctx.profile_name`` and ``hermes_constants.get_hermes_home()`` (both follow a context-local
   home override, so a multiplexed profile's turn sees its own home);
 - ``hermes_cli.plugin_events.broadcast_plugin_event`` (doorbell, C15);
-- ``tools.interrupt.is_interrupted`` (C18; not on the public plugin list, the lint warns).
+- ``tools.interrupt.is_interrupted`` (C18; not on the public plugin list, the lint warns);
+- ``ctx.get_config`` — the calling profile's ``plugins.entries.verksted.settings.<key>`` from the
+  ``config.yaml`` under ``get_hermes_home()`` (hermes_cli/plugins.py:266-277), declared in
+  ``plugin.yaml`` ``config_schema`` (card k5);
+- ``hermes_constants.PROFILE_ID_RE`` / ``get_default_hermes_root`` / ``named_profile_is_live``
+  (:302-440): a profile's home, the way ``hermes_cli.profiles.get_profile_dir`` and
+  ``profile_exists`` resolve it (:437-461; that module is not public);
+- ``hermes_constants.is_wsl`` / ``translate_cwd_for_wsl_backend`` (:1221-1266; card k6).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
-from typing import Any
+from typing import Any, Optional
 
+from . import paths as vpaths
+from .config import SETTING_KEYS
 from .store import PLUGIN_NAME, Store
 
 logger = logging.getLogger(__name__)
@@ -45,6 +55,32 @@ class HermesHost:
 
     def store(self) -> Store:
         return Store.for_active_profile()
+
+    def settings(self) -> dict[str, Any]:
+        """The calling profile's plugin settings; raw, ``config.read_settings`` validates them."""
+        return {key: self._ctx.get_config(key, None) for key in SETTING_KEYS}
+
+    def profile_home(self, name: str) -> Optional[str]:
+        """The home of profile ``name`` next to the calling profile, or None when it is not a live
+        profile there."""
+        from hermes_constants import PROFILE_ID_RE, get_default_hermes_root, get_hermes_home, named_profile_is_live
+        if not isinstance(name, str) or not PROFILE_ID_RE.fullmatch(name):
+            return None
+        root = get_default_hermes_root(home=get_hermes_home())
+        if name == "default":
+            return str(root.resolve())
+        home = root / "profiles" / name
+        return str(home.resolve()) if named_profile_is_live(home) else None
+
+    def backend(self) -> vpaths.Backend:
+        """This process's path space; on WSL with Hermes' own Windows-path translation."""
+        wsl = None
+        if sys.platform.startswith("linux"):
+            from hermes_constants import is_wsl, translate_cwd_for_wsl_backend
+            if is_wsl():
+                wsl = vpaths.Wsl(translate=translate_cwd_for_wsl_backend,
+                                 distro=os.environ.get("WSL_DISTRO_NAME", ""))
+        return vpaths.Backend(wsl=wsl)
 
     def ring(self) -> None:
         """Tell connected windows that work is waiting; the payload carries no run data."""

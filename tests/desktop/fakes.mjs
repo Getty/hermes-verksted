@@ -22,6 +22,8 @@ export const info = (enabled, extra = {}) => ({ desktop_protocol: 'hermes-gatewa
 export function storedRun(over = {}) {
   return {
     run_id: 'vk-1', state: 'waiting_for_gui', folder: '/work/a', task_preview: 'do it', parent_profile: 'default',
+    session_profile: 'default', own_toolset_tolerated: true,
+    config: { workspace: '/work/a', toolsets: ['terminal', 'file'], ceilings: [], files: [], fingerprint: 'sha256:0123456789abcdef' },
     expected_toolsets: ['file', 'terminal'], effective_toolsets: null, session_id: null, admission_id: null,
     identity: { connection_id: null, route_profile: null, target_profile: null, profile_id: null, instance_id: null },
     claim: { owner: null, generation: 0, expires_at: null, live: false },

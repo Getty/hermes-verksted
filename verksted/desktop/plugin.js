@@ -148,8 +148,9 @@ export function pendingPrompts(snapshot) {
 
 /** docs/toolset-check.md §6 step 3 / §7, with Verksted's own toolset tolerated (decision M2).
  *  `expected` is the stored list E (null = default case D1 (a)); `baseline` is the set the first
- *  check recorded, used in the default case to refuse a set that grew. */
-export function checkInfo(info, expected, baseline) {
+ *  check recorded, used in the default case to refuse a set that grew. `tolerateOwn` (M2) is false
+ *  for a run in another profile than the parent's: the recursion guard cannot see children there. */
+export function checkInfo(info, expected, baseline, tolerateOwn = true) {
   const notCheckable = detail => ({ ok: false, refusal: { reason: 'toolsets_not_checkable', detail } })
   if (!info || typeof info !== 'object') return notCheckable('the reply carries no session info')
   if (info.desktop_protocol !== CANONICAL_PROTOCOL) {
@@ -159,6 +160,10 @@ export function checkInfo(info, expected, baseline) {
   const raw = info.enabled_toolsets
   if (!Array.isArray(raw) || !raw.every(name => typeof name === 'string')) return notCheckable('enabled_toolsets is missing or not a list of names')
   const effective = [...new Set(raw)].sort()
+  if (!tolerateOwn && effective.includes(OWN_TOOLSET)) {
+    return { ok: false, refusal: { reason: 'toolsets_exceeded', missing: [], extra: [OWN_TOOLSET], enabled_toolsets: effective,
+      detail: `the session's profile enables Verksted's own toolset; a child in another profile could start runs the recursion guard cannot see. Disable the verksted plugin in that profile or decline its toolset in the profile's Tools config` } }
+  }
   if (Array.isArray(expected)) {
     const want = new Set(expected)
     const have = new Set(effective)
@@ -190,8 +195,8 @@ export function checkInfo(info, expected, baseline) {
  *  It recomputes the tools from the session policy (gateway/session_ancillary.py:80-104), apart from
  *  the inventory, which reports [] both for an empty selection and when it failed. Only the own
  *  toolset's tools may be listed, by name, and the total must be what the sections list.
- *  Returns null when it agrees, else why not. */
-export function onlyOwnTools(shown) {
+ *  Returns null when it agrees, else why not. Without `tolerateOwn` no tool may be listed at all. */
+export function onlyOwnTools(shown, tolerateOwn = true) {
   const sections = shown && Array.isArray(shown.sections) ? shown.sections : null
   if (!sections) return 'tools.show answered without sections'
   let listed = 0
@@ -200,7 +205,7 @@ export function onlyOwnTools(shown) {
     for (const tool of (section && Array.isArray(section.tools) ? section.tools : [])) {
       listed += 1
       const name = tool && typeof tool.name === 'string' ? tool.name : '?'
-      if (!(section.name === OWN_TOOLSET && OWN_TOOLS.includes(name))) foreign.push(`${section && section.name}/${name}`)
+      if (!(tolerateOwn && section.name === OWN_TOOLSET && OWN_TOOLS.includes(name))) foreign.push(`${section && section.name}/${name}`)
     }
   }
   if (listed !== shown.total) return `tools.show counts ${shown.total} tools but lists ${listed}`
@@ -213,7 +218,7 @@ export function onlyOwnTools(shown) {
  *  (gateway/session_authority.py:451-460). Returns { adopt, status } for our own admission,
  *  { unclear } when the snapshot cannot rule one out, or { check } with the toolset check of a
  *  session in which nothing ran yet. */
-export function submitVerdict(snap, expected, baseline, submissionId) {
+export function submitVerdict(snap, expected, baseline, submissionId, tolerateOwn = true) {
   const pending = snap && Array.isArray(snap.pending) ? snap.pending : null
   const mine = pending && pending.find(p => p && p.input_id === submissionId && typeof p.admission_id === 'string' && p.admission_id)
   if (mine) return { adopt: mine.admission_id, status: mine.status }
@@ -223,7 +228,7 @@ export function submitVerdict(snap, expected, baseline, submissionId) {
   if (!info || typeof info !== 'object' || info.lazy !== true) {
     return { unclear: 'the session already has an agent or reports no info; its tools can no longer be attested' }
   }
-  return { check: checkInfo(info, expected, baseline) }
+  return { check: checkInfo(info, expected, baseline, tolerateOwn) }
 }
 
 function randomId() {
@@ -308,6 +313,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
   // -- one start, on one retained route ------------------------------------------------------
   async function drive(runId, run, route, identity) {
     const expected = Array.isArray(run.expected_toolsets) ? run.expected_toolsets : null
+    const tolerateOwn = run.own_toolset_tolerated === true // fail closed: only the API says so
     let state = run.state
     let sessionId = run.session_id || null
     let admissionId = run.admission_id || null
@@ -377,7 +383,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
 
       let baseline = Array.isArray(run.effective_toolsets) ? run.effective_toolsets : null
       if (state === 'session_created') {
-        const first = checkInfo(info, expected, null)
+        const first = checkInfo(info, expected, null, tolerateOwn)
         if (!first.ok) return refuse(first.refusal)
         let shown
         try {
@@ -391,7 +397,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
         if (!first.effective.some(name => name !== OWN_TOOLSET)) {
           // E = [] or a default case that reads empty: only tools.show tells apart "nothing
           // selected" from an inventory that failed open (toolset-check.md §10 M2).
-          const why = onlyOwnTools(shown)
+          const why = onlyOwnTools(shown, tolerateOwn)
           if (why) return refuse({ reason: 'toolsets_not_checkable', detail: why })
         }
         await step(runId, 'toolsets_checked', {
@@ -409,13 +415,13 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
           if (err instanceof Deferred) throw err
           return refuse({ reason: 'toolsets_not_checkable', detail: `session.info failed: ${failureOf(err).detail}` })
         }
-        const second = checkInfo(again, expected, baseline)
+        const second = checkInfo(again, expected, baseline, tolerateOwn)
         if (!second.ok) return refuse(second.refusal)
         await step(runId, 'submit_requested', { identity })
         state = 'submit_requested'
       } else if (state === 'submit_requested') {
         // Reconciling an unconfirmed submit: decide from the fresh snapshot, never repeat blindly.
-        const verdict = submitVerdict(snap, expected, baseline, run.submission_id)
+        const verdict = submitVerdict(snap, expected, baseline, run.submission_id, tolerateOwn)
         if (verdict.adopt) return running(verdict.adopt, verdict.status)
         if (verdict.unclear) return unsure(verdict.unclear)
         if (!verdict.check.ok) return refuse(verdict.check.refusal)
@@ -434,7 +440,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
             if (err instanceof Deferred) throw err
             return sent ? unsure(`session.resume failed: ${failureOf(err).detail}`) : refuse(rpcRefusal(err, 'resume_refused'))
           }
-          const verdict = submitVerdict(fresh, expected, baseline, run.submission_id)
+          const verdict = submitVerdict(fresh, expected, baseline, run.submission_id, tolerateOwn)
           if (verdict.adopt) return running(verdict.adopt, verdict.status)
           if (verdict.unclear) return sent ? unsure(verdict.unclear) : refuse({ reason: 'toolsets_not_checkable', detail: verdict.unclear })
           if (!verdict.check.ok) return refuse(verdict.check.refusal)
@@ -467,38 +473,48 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
   // -- claim one run ------------------------------------------------------------------------
   async function take(summary) {
     const runId = summary.run_id
-    const route = pickRoute(await host.profileRoutes(), scope())
-    if (!route) {
+    const routes = await host.profileRoutes()
+    const active = pickRoute(routes, scope())
+    if (!active) {
       publish({ note: 'Kein eindeutiger Verbindungsweg für das aktive Profil gefunden.' })
       return
     }
+    // The session runs in the profile frozen at run (k5), on this window's connection: the store and
+    // ctx.rest stay with the parent's profile, only the session route changes.
+    const wanted = typeof summary.session_profile === 'string' && summary.session_profile ? summary.session_profile : active.profile
+    const route = wanted === active.profile ? active : pickRoute(routes, { connectionId: active.connectionId, profile: wanted })
     const stored = summary.identity || {}
-    if (summary.state === 'running' && stored.connection_id && !sameIdentity(stored, {
+    if (summary.state === 'running' && stored.connection_id && !(route && sameIdentity(stored, {
       connection_id: route.connectionId, route_profile: route.profile, target_profile: route.targetProfile,
       profile_id: stored.profile_id
-    })) {
+    }))) {
       return // a running child of another connection: left to that connection (k8 decides takeovers)
     }
 
     let describe = null
-    let gate = null
-    try {
-      describe = await rpc(route, 'runtime.describe', {})
-    } catch (err) {
-      if (!isRpcError(err)) throw err // no reply: try again on the next poll
-      if (err.code !== -32601) {
-        // Only an unknown method marks a legacy route (gateway/session_controls.py:354-359). A
-        // refusal (draining :296-304, storage 5001 :373-377, permission :534-538) is this
-        // gateway's state now: claim nothing, a later poll or another window tries again.
-        const f = failureOf(err)
-        publish({ note: `runtime.describe refused (${f.reason || f.code}): ${f.detail}. Der Auftrag wartet.` })
-        return
-      }
-      gate = { reason: 'legacy_route', detail: 'runtime.describe is unknown on this route (legacy gateway); Verksted needs the canonical gateway' }
+    let gate = route ? null : {
+      reason: 'profile_route_missing',
+      detail: `this window's connection ${active.connectionId} has no route to profile ${wanted}; the session would have to start elsewhere`
     }
-    const caps = describe && Array.isArray(describe.capabilities) ? describe.capabilities : []
-    if (!gate && !caps.includes(REQUIRED_CAPABILITY)) {
-      gate = { reason: 'legacy_route', detail: `runtime.describe does not list ${REQUIRED_CAPABILITY}` }
+    if (route) {
+      try {
+        describe = await rpc(route, 'runtime.describe', {})
+      } catch (err) {
+        if (!isRpcError(err)) throw err // no reply: try again on the next poll
+        if (err.code !== -32601) {
+          // Only an unknown method marks a legacy route (gateway/session_controls.py:354-359). A
+          // refusal (draining :296-304, storage 5001 :373-377, permission :534-538) is this
+          // gateway's state now: claim nothing, a later poll or another window tries again.
+          const f = failureOf(err)
+          publish({ note: `runtime.describe refused (${f.reason || f.code}): ${f.detail}. Der Auftrag wartet.` })
+          return
+        }
+        gate = { reason: 'legacy_route', detail: 'runtime.describe is unknown on this route (legacy gateway); Verksted needs the canonical gateway' }
+      }
+      const caps = describe && Array.isArray(describe.capabilities) ? describe.capabilities : []
+      if (!gate && !caps.includes(REQUIRED_CAPABILITY)) {
+        gate = { reason: 'legacy_route', detail: `runtime.describe does not list ${REQUIRED_CAPABILITY}` }
+      }
     }
 
     const claim = await api(`/runs/${enc(runId)}/claim`, {
@@ -768,6 +784,23 @@ function StatusChip({ worker, host }) {
   }, text)
 }
 
+/** The resolved state frozen at run, in one line (arch §3: "Die GUI zeigt den aufgelösten Stand"). */
+export function configLine(run) {
+  const listed = Array.isArray(run.expected_toolsets)
+    ? (run.expected_toolsets.length ? run.expected_toolsets.join(', ') : 'keine')
+    : 'Profil-Standard'
+  const config = run.config || {}
+  const parts = [`Toolsets: ${listed}`]
+  if (config.workspace) parts.push(`Arbeitsbereich: ${config.workspace}`)
+  if (typeof config.fingerprint === 'string') parts.push(config.fingerprint.slice(0, 19))
+  return parts.join(' · ')
+}
+
+function profileLine(run) {
+  const session = run.session_profile || run.parent_profile
+  return session === run.parent_profile ? session : `${session} (aus ${run.parent_profile})`
+}
+
 function RunRow({ run, worker, now }) {
   const label = labelOf(run, now)
   const children = [
@@ -775,7 +808,8 @@ function RunRow({ run, worker, now }) {
       h('span', { className: 'font-medium' }, run.folder),
       h('span', { className: label.waiting ? 'text-(--ui-text-warning)' : 'text-(--ui-text-secondary)' }, label.text),
       label.stale ? h('span', { className: 'text-(--ui-text-tertiary)' }, '(veraltet)') : null),
-    h('div', { key: 'task', className: 'text-(--ui-text-tertiary)' }, `${run.parent_profile} · ${run.task_preview}`)
+    h('div', { key: 'task', className: 'text-(--ui-text-tertiary)' }, `${profileLine(run)} · ${run.task_preview}`),
+    h('div', { key: 'config', className: 'text-(--ui-text-tertiary)' }, configLine(run))
   ]
   if (run.reason) children.push(h('div', { key: 'reason' }, `${run.reason}: ${run.detail || ''}`))
   if (run.result_preview) children.push(h('div', { key: 'result', className: 'whitespace-pre-wrap' }, run.result_preview))

@@ -13,6 +13,7 @@ home = Path(os.environ["HERMES_HOME"]).resolve()
 assert ".dev/test-homes/" in str(home), f"refusing to run against {home}"
 workspace = sys.argv[1]
 result_file = Path(sys.argv[2])
+extra = json.loads(sys.argv[3]) if len(sys.argv) > 3 else {}  # k5: folders for the settings checks
 out: dict = {"home": str(home)}
 
 import model_tools  # noqa: E402  (loads the plugin system like an agent process does)
@@ -55,6 +56,11 @@ try:
     out["run"] = call({"action": "run", "folder": workspace, "task": "Say hello", "wait_seconds": 0})
     out["status"] = call({"action": "status", "handle": out["run"].get("handle")})
     out["busy"] = call({"action": "run", "folder": workspace, "task": "again", "wait_seconds": 0})
+    # k5: plugin settings through ctx.get_config, a profile switch resolved with hermes_constants.
+    if extra.get("switched"):
+        out["switched"] = call({"action": "run", "folder": extra["switched"], "task": "Research", "wait_seconds": 0})
+    if extra.get("outside"):
+        out["outside"] = call({"action": "run", "folder": extra["outside"], "task": "x", "wait_seconds": 0})
     # With the default tools.tool_search.enabled: auto a plugin tool is deferred: the model reaches it
     # through the bridge, which must keep the caller's ids (the parent binding).
     from tools.tool_search import is_deferrable_tool_name, load_config_readonly  # noqa: E402
@@ -100,4 +106,14 @@ out["stale"] = client.post(f"{base}/runs/{handle}/step", headers=token,
                                  "data": {"identity": identity, "session_id": "s"}}).json()
 out["mismatch"] = client.post(f"{base}/runs/{handle}/claim", headers=token,
                               json={"owner": "w2", "profile_id": "/somewhere/else"}).json()
+switched = (out.get("switched") or {}).get("handle")
+if switched:
+    # A switched run is claimed with the session profile's route: the parent's own home is refused.
+    out["switched_parent_route"] = client.post(f"{base}/runs/{switched}/claim", headers=token,
+                                               json={"owner": "w3", "profile_id": str(home)}).json()
+    granted = client.post(f"{base}/runs/{switched}/claim", headers=token,
+                          json={"owner": "w3", "profile_id": extra["research_home"]}).json()
+    out["switched_claim"] = {"ok": granted.get("ok"), "code": granted.get("code"),
+                             "session_profile": (granted.get("run") or {}).get("session_profile"),
+                             "own_toolset_tolerated": (granted.get("run") or {}).get("own_toolset_tolerated")}
 result_file.write_text(json.dumps(out, default=str), encoding="utf-8")

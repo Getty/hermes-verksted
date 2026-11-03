@@ -639,3 +639,85 @@ test('fix 8: reconciling an unconfirmed submit never submits into a session it c
   assert.equal(calls(env.log, 'prompt.submit').length, 0)
   assert.equal(steps(env.log).find(s => s.name === 'running').data.admission_id, 'adm-9')
 })
+
+// -- k5: a run in another profile -----------------------------------------------------------------
+
+const RESEARCH_ROUTE = Object.freeze({ connectionId: 'local', mode: 'local', primary: false, profile: 'research', targetProfile: 'research' })
+const RESEARCH_DESCRIBE = Object.freeze({ ...DESCRIBE, profile_id: '/homes/research', instance_id: 'inst-r' })
+const switchedRun = (over = {}) => storedRun({ session_profile: 'research', own_toolset_tolerated: false, ...over })
+const researchHandlers = (enabled = ['file', 'terminal']) => ({ ...happyHandlers(enabled), 'runtime.describe': RESEARCH_DESCRIBE })
+
+test('k5: a run in another profile starts on that profile\'s route of the same connection', async () => {
+  const other = { ...RESEARCH_ROUTE, connectionId: 'remote-1' } // same profile name elsewhere: another profile
+  const env = setup({ run: switchedRun(), routes: [ROUTE, RESEARCH_ROUTE, other], handlers: researchHandlers() })
+  const routesUsed = []
+  const request = env.host.requestProfile
+  env.host.requestProfile = async (route, method, params) => { routesUsed.push([route, method]); return request(route, method, params) }
+  await worker(env).poll()
+  assert.equal(env.api.state.run.state, 'running')
+  assert.ok(routesUsed.length && routesUsed.every(([route]) => route === RESEARCH_ROUTE), 'every call on the research route')
+  const claim = env.log.find(([kind, action]) => kind === 'rest' && action === 'claim')[3]
+  assert.equal(claim.profile_id, '/homes/research') // the API checks it against the frozen session profile home
+  assert.deepEqual(steps(env.log)[0].data.identity, {
+    connection_id: 'local', route_profile: 'research', target_profile: 'research',
+    profile_id: '/homes/research', instance_id: 'inst-r', subject: null
+  })
+})
+
+test('k5: without a route to the session profile on this connection the run is refused, Hermes untouched', async () => {
+  const env = setup({ run: switchedRun(), routes: [ROUTE, { ...RESEARCH_ROUTE, connectionId: 'remote-1' }] })
+  await worker(env).poll()
+  assert.equal(calls(env.log, 'runtime.describe').length + calls(env.log, 'session.create').length, 0)
+  assert.equal(lastStep(env.log).name, 'refused')
+  assert.equal(lastStep(env.log).data.reason, 'profile_route_missing')
+})
+
+test('k5: Verksted\'s own toolset is not tolerated in another profile', async () => {
+  const env = setup({ run: switchedRun(), routes: [ROUTE, RESEARCH_ROUTE], handlers: researchHandlers(['file', 'terminal', 'verksted']) })
+  await worker(env).poll()
+  assert.equal(calls(env.log, 'prompt.submit').length, 0)
+  assert.equal(lastStep(env.log).data.reason, 'toolsets_exceeded')
+  assert.deepEqual(lastStep(env.log).data.extra, ['verksted'])
+
+  // The default case and the empty selection too: there the own tool would ride in unchecked.
+  const base = storedRun().create_params
+  const empty = switchedRun({ expected_toolsets: [], create_params: { ...base, toolsets: ['no_mcp'] } })
+  const own = researchHandlers(['verksted'])
+  own['tools.show'] = { sections: [{ name: 'verksted', tools: [{ name: 'verksted' }] }], total: 1 }
+  const e1 = setup({ run: empty, routes: [ROUTE, RESEARCH_ROUTE], handlers: own })
+  await worker(e1).poll()
+  assert.equal(lastStep(e1.log).data.reason, 'toolsets_exceeded')
+
+  const none = researchHandlers([])
+  none['tools.show'] = { sections: [{ name: 'verksted', tools: [{ name: 'verksted' }] }], total: 1 }
+  const e2 = setup({ run: empty, routes: [ROUTE, RESEARCH_ROUTE], handlers: none })
+  await worker(e2).poll()
+  assert.equal(lastStep(e2.log).data.reason, 'toolsets_not_checkable') // tools.show lists the own tool anyway
+
+  const quiet = researchHandlers([])
+  quiet['tools.show'] = { sections: [], total: 0 }
+  const e3 = setup({ run: empty, routes: [ROUTE, RESEARCH_ROUTE], handlers: quiet })
+  await worker(e3).poll()
+  assert.equal(e3.api.state.run.state, 'running')
+})
+
+test('k5: a run without the API saying so does not tolerate the own toolset (fail closed)', async () => {
+  const run = storedRun()
+  delete run.own_toolset_tolerated
+  const env = setup({ run, handlers: happyHandlers(['file', 'terminal', 'verksted']) })
+  await worker(env).poll()
+  assert.equal(lastStep(env.log).data.reason, 'toolsets_exceeded')
+})
+
+test('k5: checkInfo refuses the own toolset only when told to', () => {
+  assert.equal(checkInfo(info(['file', 'verksted']), ['file'], null, false).refusal.reason, 'toolsets_exceeded')
+  assert.equal(checkInfo(info(['file', 'verksted']), null, null, false).refusal.reason, 'toolsets_exceeded')
+  assert.equal(checkInfo(info(['file']), ['file'], null, false).ok, true)
+})
+
+test('k5: the run view shows the resolved state', () => {
+  const { configLine } = plugin
+  assert.equal(configLine(storedRun()), 'Toolsets: file, terminal · Arbeitsbereich: /work/a · sha256:0123456789ab')
+  assert.equal(configLine({ expected_toolsets: null, config: {} }), 'Toolsets: Profil-Standard')
+  assert.equal(configLine({ expected_toolsets: [] }), 'Toolsets: keine')
+})

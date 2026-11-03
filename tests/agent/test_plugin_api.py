@@ -131,6 +131,39 @@ def test_a_route_of_another_profile_home_cannot_claim(api, tmp_path):
     assert api.claim(run["run_id"], profile_id=str(link))["ok"]  # the same home, spelled differently
 
 
+def _switched_record(n, folder, research_home):
+    return run_record(n, folder, resolved_config={
+        "version": 1, "workspace": folder, "registered": False, "profile": "research",
+        "profile_home": research_home, "profile_switched": True, "toolsets": ["file"],
+        "ceilings": [{"source": f"{folder}/.verksted.yaml", "toolsets": ["file"]}],
+        "files": [{"path": f"{folder}/.verksted.yaml", "sha256": "sha256:abc"}]})
+
+
+def test_a_run_in_another_profile_is_claimed_with_that_profiles_route(api, tmp_path):
+    research = tmp_path / "research-home"
+    research.mkdir()
+    run = api.store.create_run(_switched_record(1, "/work/a", str(research.resolve())), max_active=4)
+    # The parent's own route serves the store's home, not the session profile: refused.
+    answer = api.claim(run["run_id"], profile_id=api.home)
+    assert answer["code"] == "profile_mismatch" and answer["profile_home"] == str(research.resolve())
+    granted = api.claim(run["run_id"], profile_id=str(research))
+    assert granted["ok"] and granted["run"]["session_profile"] == "research"
+    assert granted["run"]["own_toolset_tolerated"] is False
+    assert granted["run"]["parent_profile"] == "default"
+
+
+def test_summaries_show_the_resolved_state(api):
+    same = api.store.create_run(run_record(1, "/work/a"), max_active=4)
+    switched = api.store.create_run(_switched_record(2, "/work/b", "/homes/research"), max_active=4)
+    runs = {r["run_id"]: r for r in api.get("/runs")["runs"]}
+    assert runs[same["run_id"]]["session_profile"] == "default"
+    assert runs[same["run_id"]]["own_toolset_tolerated"] is True
+    config = runs[switched["run_id"]]["config"]
+    assert config == {"workspace": "/work/b", "toolsets": ["file"],
+                      "ceilings": [{"source": "/work/b/.verksted.yaml", "toolsets": ["file"]}],
+                      "files": ["/work/b/.verksted.yaml"], "fingerprint": "sha256:x"}
+
+
 def test_a_legacy_route_claims_without_profile_id_to_record_the_refusal(api):
     run = api.store.create_run(run_record(), max_active=4)
     granted = api.claim(run["run_id"], profile_id=None)

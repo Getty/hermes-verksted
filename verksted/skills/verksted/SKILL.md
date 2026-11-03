@@ -124,6 +124,11 @@ Codes that need a specific response:
 - `error.code: "too_many_runs"`: too many active runs in this profile. Collect one first.
 - `error.code: "recursion_refused"`: you are a Verksted child session yourself. Do the work here
   or report back.
+- `error.code: "not_in_workspace"`, `error.code: "toolsets_widen"`, `error.code: "toolsets_required"`,
+  `error.code: "profile_not_allowed"`, `error.code: "profile_missing"`, `error.code: "bad_config"`,
+  `error.code: "bad_settings"`: the `.verksted.yaml` files above the folder or Verksted's plugin
+  settings do not allow this run. Tell the user what `error.message` says. Do not change them
+  yourself, and do not pick another folder to get around the refusal; that is the user's decision.
 - `error.code: "not_found"`: the handle does not belong to this chat. Use the handle that a `run`
   in this conversation returned.
 

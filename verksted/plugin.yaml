@@ -8,3 +8,18 @@ provides_tools:
   - verksted
 provides_hooks:
   - post_compaction
+# Settings of the calling profile (plugins.entries.verksted.settings), read at every run and
+# frozen into it. Hermes Desktop shows them under Settings → Plugins → Verksted.
+config_schema:
+  workspaces:
+    type: list
+    label: "Workspaces"
+    description: "Absolute folder paths on this backend. When set, Verksted runs only inside these folders, and the outermost one that contains a target is the root its .verksted.yaml files are read from."
+  allowed_profiles:
+    type: list
+    label: "Allowed profiles"
+    description: "Profiles a folder's .verksted.yaml may run its session in. The calling profile is always allowed."
+  toolset_ceiling:
+    type: list
+    label: "Toolset ceiling"
+    description: "Optional: the most toolsets any run may get. When set, every folder must list its toolsets in .verksted.yaml, within this list."

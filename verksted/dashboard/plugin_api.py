@@ -105,14 +105,32 @@ def _lease(body: dict[str, Any]) -> float:
     return max(LEASE_MIN_S, min(LEASE_MAX_S, float(raw)))
 
 
+def _session_profile(run: dict[str, Any]) -> tuple[str, bool]:
+    """The profile the child session runs in, frozen at run (card k5), and whether it is another
+    one than the parent's."""
+    resolved = run.get("resolved_config") or {}
+    profile = resolved.get("profile") or run["parent_profile"]
+    return profile, profile != run["parent_profile"]
+
+
 def _summary(run: dict[str, Any], now: float) -> dict[str, Any]:
     detail = run.get("state_detail") or {}
+    resolved = run.get("resolved_config") or {}
+    session_profile, switched = _session_profile(run)
     out = {
         "run_id": run["run_id"],
         "state": run["state"],
         "folder": run["target_dir"],
         "task_preview": (run.get("task") or "")[:200],
         "parent_profile": run["parent_profile"],
+        # The Desktop part starts the session on this profile's route of its own connection. Verksted's
+        # own toolset is tolerated only in the parent's profile, where the recursion guard sees children.
+        "session_profile": session_profile,
+        "own_toolset_tolerated": not switched,
+        "config": {"workspace": resolved.get("workspace"), "toolsets": resolved.get("toolsets"),
+                   "ceilings": resolved.get("ceilings") or [],
+                   "files": [f.get("path") if isinstance(f, dict) else f for f in resolved.get("files") or []],
+                   "fingerprint": run.get("config_fingerprint")},
         "created_at": run["created_at"],
         "updated_at": run["updated_at"],
         "last_known_at": run.get("last_known_at"),
@@ -164,17 +182,27 @@ def _list(claimable_only: bool) -> dict[str, Any]:
 
 def _claim(run_id: str, body: dict[str, Any], principal: dict[str, Any]) -> dict[str, Any]:
     owner = _owner(body)
+    store = _store()
     # The route's runtime.describe profile_id; null only when describe failed (a legacy route),
     # where the claim exists to record the refusal.
     profile_id = body.get("profile_id")
     if profile_id is not None:
         if not isinstance(profile_id, str) or not profile_id:
             return _refuse("bad_profile_id", "profile_id must be the route's runtime.describe profile_id or null")
-        home = _profile_home()
-        if not _same_home(profile_id, home):
-            return _refuse("profile_mismatch", "the route's gateway serves another profile home than this store",
-                           profile_home=home)
-    granted = _store().claim(run_id, owner, principal=principal, lease_s=_lease(body))
+        run = store.get_run(run_id)
+        if run is not None and _session_profile(run)[1]:
+            # A switched run (k5): the route must serve the session profile frozen at run, while the
+            # store stays this (the parent's) profile's.
+            home = (run.get("resolved_config") or {}).get("profile_home") or ""
+            if not home or not _same_home(profile_id, home):
+                return _refuse("profile_mismatch", "the route's gateway serves another profile home than the "
+                                                   "run's session profile", profile_home=home)
+        else:
+            home = _profile_home()
+            if not _same_home(profile_id, home):
+                return _refuse("profile_mismatch", "the route's gateway serves another profile home than this store",
+                               profile_home=home)
+    granted = store.claim(run_id, owner, principal=principal, lease_s=_lease(body))
     # The subject this claim is authenticated as: the Desktop part compares it with the stored one
     # before it repeats any start call (the store compares it again on every step).
     return {"ok": True, "generation": granted["generation"], "expires_at": granted["expires_at"],

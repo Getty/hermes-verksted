@@ -1,6 +1,19 @@
 Revision history for Verksted
 
 {{$NEXT}}
+  - .verksted.yaml is resolved from the plugin settings workspaces,
+    allowed_profiles and toolset_ceiling: the walk starts at the outermost
+    registered workspace (without one, at every ancestor); missing values
+    inherit, lists only narrow and widening is refused; the file may hold
+    only version, profile and toolsets, credentials and models are refused
+    by name. A run may use another allowed profile on the same connection,
+    the store stays with the parent. Resolved state, file hashes and
+    fingerprint are frozen at run and shown by status and the Desktop part.
+  - Folders are checked on the executing backend: canonical real path,
+    byte-exact names, one active run per folder on a case-folded key.
+    Windows drive paths only (\\?\ is stored plain, UNC and device paths are
+    refused); a WSL backend maps Windows paths with Hermes' helper, elsewhere
+    they are refused; files must stay inside the folder.
   - verksted tool (run, status, wait; send and cancel refuse for now)
     stores every run with all start ids before anything starts it; SQLite
     run and claim store with claim generations; plugin API for claims and

@@ -53,8 +53,8 @@ DESCRIPTION = (
     "it returns a handle and waits up to wait_seconds (default 60, max 240) for the result. "
     "action=status reports a run's state at once; action=wait waits up to wait_seconds "
     "(default 120, max 240) for it to finish or to need the user. A run keeps going when a call "
-    "returns; call wait again with the handle. Runs only in the calling profile; folder settings "
-    "come from the folder's .verksted.yaml."
+    "returns; call wait again with the handle. Toolsets and profile come from the .verksted.yaml "
+    "files from the workspace root down to the folder, frozen at run; status shows what was resolved."
 )
 
 SCHEMA: dict[str, Any] = {
@@ -157,9 +157,11 @@ def _run(host: Any, store: Any, caller: dict[str, Any], args: dict[str, Any],
     if len(task.encode("utf-8")) > TASK_LIMIT:
         raise ToolRefused("bad_args", f"task is longer than {TASK_LIMIT} bytes; put details into a file in the folder")
     seconds = _wait_seconds(args, "run")
-    folder, key = vpaths.canonical_folder(args.get("folder"))
-    files = vpaths.relative_files(folder, args.get("files"))
-    resolved = vconfig.resolve(folder, parent_profile=caller["profile"])
+    backend = host.backend()
+    folder, key = vpaths.canonical_folder(args.get("folder"), backend)
+    files = vpaths.relative_files(folder, args.get("files"), backend)
+    resolved = vconfig.resolve(folder, parent_profile=caller["profile"], parent_profile_home=caller["profile_home"],
+                               settings=host.settings(), profile_home=host.profile_home, backend=backend)
     requested, expected = vconfig.start_toolsets(resolved)
 
     run_id = "vk-" + uuid.uuid4().hex
@@ -292,13 +294,22 @@ def _view(run: dict[str, Any], now: float, *, wait_end: Optional[str] = None) ->
     waiting = prompts[0]["kind"] if prompts else None
     claimed = (run.get("claim_expires_at") or 0) > now
     stale = state in _STARTING + ("running",) and not claimed
+    resolved = run.get("resolved_config") or {}
     out: dict[str, Any] = {
         "ok": True,
         "handle": run["run_id"],
         "state": state,
         "label": WAITING_LABELS[waiting] if waiting else LABELS[state],
         "folder": run["target_dir"],
-        "profile": run["parent_profile"],
+        "profile": resolved.get("profile") or run["parent_profile"],  # the profile the child runs in
+        "config": {  # the state frozen at run (arch §3: "Die GUI zeigt den aufgelösten Stand")
+            "workspace": resolved.get("workspace"),
+            "toolsets": resolved.get("toolsets"),
+            "ceilings": resolved.get("ceilings") or [],
+            "files": resolved.get("files") or [],
+            "profile_switched": bool(resolved.get("profile_switched")),
+            "fingerprint": run.get("config_fingerprint"),
+        },
         "toolsets": run.get("expected_toolsets"),
         "effective_toolsets": run.get("effective_toolsets"),
         "session_id": run.get("session_id"),

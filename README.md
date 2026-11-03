@@ -54,11 +54,12 @@ Both halves must be on: the agent part (`plugins.enabled` of the profile) **and*
 Desktop part (Hermes Desktop → Capabilities → Plugins). Copy the package, never link it —
 Hermes refuses symlinks and junctions in plugin folders.
 
-- **Desktop dialog** (Capabilities → Plugins → Install plugin): a Git URL of this repository
-  with the subfolder, e.g. `file:///C:/Users/<you>/src/hermes-verksted#verksted`, pinned to a
-  commit. One run installs and enables both halves. Needs Git on the machine. (Not yet
-  exercised; whether the dialog accepts `#verksted` is the first Windows check.)
-- **CLI:** `hermes plugins install <git-url>#verksted --ref <commit>`.
+- **Desktop dialog** (Capabilities → Plugins → Install plugin): the Git URL with the
+  subfolder, `https://github.com/Getty/hermes-verksted.git#verksted` (or a local clone as
+  `file:///C:/Users/<you>/src/hermes-verksted#verksted`), pinned to a commit. One run installs
+  and enables both halves. Needs Git on the machine. (Not yet exercised; whether the dialog
+  accepts `#verksted` is the first Windows check.)
+- **CLI:** `hermes plugins install https://github.com/Getty/hermes-verksted.git#verksted --ref <commit>`.
 - **Manual copy:** unzip `verksted-<version>.zip` (built with `make package`, top folder
   `verksted/`) into `<HERMES_HOME>/plugins/`, or copy `verksted/` to
   `<HERMES_HOME>/plugins/verksted/`; add `verksted` to `plugins.enabled` in that profile's

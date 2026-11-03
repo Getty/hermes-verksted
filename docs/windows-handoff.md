@@ -10,7 +10,8 @@ what happens, and turn the results into cards.
 
 - **Package:** `verksted/` (agent part, plugin API, Desktop part, bundled skill), version
   `0.1.0`, unreleased. `Changes` has an unstamped `{{$NEXT}}` section.
-- **Commits:** on `main` (`git log`), not pushed.
+- **Repository:** https://github.com/Getty/hermes-verksted (public), branch `main`; the karr
+  board is pushed too (`refs/karr/*`).
 - **Verified on Linux** (all against throwaway homes under `.dev/`, Hermes `ad2b705`):
   - `make test`: 258 pytest (incl. a contract test against the pinned Hermes) and 89 node
     tests, 0 skipped.
@@ -31,11 +32,12 @@ Desktop renderer is a Node stand-in ported from the Desktop's canonical client
 
 ## 2 Getting the repo onto Windows
 
-The repository has not been pushed: that needs the maintainer's go-ahead. Two ways:
-
-- **Copy the folder** including `.git` (the karr board lives in `refs/karr/*` inside it), but
-  **without `.dev/`** (1.8 GB of Linux venv and Hermes checkout, useless on Windows).
-- **Or** the maintainer pushes `main` and the karr refs to a private remote and you clone it.
+```powershell
+git clone https://github.com/Getty/hermes-verksted.git
+cd hermes-verksted
+karr sync --pull        # the board lives in refs/karr/*, which a plain clone does not fetch
+karr list --compact     # k1 and k4 should be the open cards
+```
 
 Then, in the Windows checkout:
 

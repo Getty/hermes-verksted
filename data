@@ -1,0 +1,36 @@
+---
+claimed_at: 2026-11-03T17:30:52Z
+claimed_by: verksted-worker
+class: standard
+completed: 2026-11-03T17:30:52Z
+created: 2026-11-03T02:50:10Z
+depends_on:
+- 4
+id: 5
+priority: medium
+started: 2026-11-03T05:36:50Z
+status: done
+tags:
+- step-2
+- config
+title: .verksted.yaml resolution, allowed profiles and config fingerprint
+updated: 2026-11-03T17:30:54Z
+---
+
+docs/architecture.md §2 and §3: read from the registered workspace down to the target folder; missing values inherit, explicit lists replace and may only narrow the ceiling; profile only from the plugin's allowed profiles; no credentials or backend addresses from the project; resolved state + fingerprint stored at start. Cases: default, explicit, empty [] and invalid toolsets.
+
+2026-11-03 05:53 Started (verksted-worker). Interfaces read at ad2b705: ctx.get_config (hermes_cli/plugins.py:266-277, reads plugins.entries.verksted.settings.<key> of the calling profile's config.yaml), config_schema (plugins/index.md:960-1045), hermes_constants PROFILE_ID_RE / get_default_hermes_root / named_profile_is_live (:302-440), Desktop routes per profile on one local connection (plugin-profile-routes.ts, store/gateway.ts:1118-1150). Profile switching looks doable through public interfaces; decisions follow with the implementation.
+
+2026-11-03 17:27 Decisions (mine, verksted-worker):
+- Root: with plugin setting `workspaces` registered, the folder must lie inside one (`not_in_workspace` otherwise); the OUTERMOST containing registration is the root, so a deeper registration can never skip an ancestor's file; the walk starts there (arch §2). Without registration (my addition beyond §2): every ancestor up to the filesystem root is read and the topmost file is the root. Confinement needs registration: unregistered, a folder outside every configured tree (also via a link/junction out of one) has only the plugin ceiling over it. Registered folders that are missing are skipped; malformed settings refuse every run (`bad_settings`). Walk bound: 64 folders (`folder_too_deep`). The folder is canonical (k6) before the walk, so links resolve first.
+- Plugin settings: `workspaces`, `allowed_profiles`, `toolset_ceiling` (plugin.yaml config_schema, type list → Desktop Settings → Plugins JSON editor), read with ctx.get_config = plugins.entries.verksted.settings.<key> of the CALLING profile's config.yaml, frozen into the run. Exercised at ad2b705 in tests/agent/test_hermes_contract.py.
+- Merge: missing values inherit; nearest explicit list is the selection; plugin ceiling + every ancestor list are ceilings; a list beyond any earlier ceiling is refused `toolsets_widen`, never clipped; [] is empty; D1(a): under any ceiling an explicit list is required (`toolsets_required`), the ceiling is never sent as the selection. `verksted` is a reserved toolset name in files and ceiling.
+- File: only version/profile/toolsets; api_key, base_url, provider, model, env, mcp_servers refused by name; anything else unknown refused; explicit null refused; version must be the int 1 (true/"1"/1.0 refused); profile must match Hermes' PROFILE_ID_RE; 64 KiB cap; UTF-8 (BOM ok); duplicate keys refused; a file that exists but cannot be read fails closed (`bad_config`).
+- Profile: nearest wins; another than the parent's must be in allowed_profiles (`profile_not_allowed`) and exist (`profile_missing`, hermes_constants get_default_hermes_root + named_profile_is_live). Switching implemented: Desktop uses host.profileRoutes() route of that profile on the SAME connection (arch §5), plugin API checks the route's profile_id against the frozen session-profile home; store, binding and doorbell stay with the parent (§4). No such route → refused `profile_route_missing` before Hermes is touched. A switched run does NOT tolerate Verksted's own toolset in the child (the depth-1 recursion guard only sees the parent store) → `toolsets_exceeded`; the API flag `own_toolset_tolerated` is read fail-closed.
+- Freeze/fingerprint: resolved state incl. file paths + sha256 and ceilings stored at run; status shows it under `config` and `profile`; the Desktop row shows profile ("research (aus default)") and toolsets · Arbeitsbereich · fingerprint.
+- Skill: added one bullet for the config refusal codes (tell the user, do not edit .verksted.yaml/settings, do not dodge via another folder).
+Drift (not in scope): (1) arch §3 still says "Ohne toolsets gelten ... Defaults des Zielprofils innerhalb der festgelegten Obergrenze" — D1(a) refuses that case; §3 wording is the maintainer's call. (2) SKILL.md step 1 finds the layout root as the nearest folder with .verksted.yaml or workflow/; the demo's step folders carry .verksted.yaml, so from a step folder that is the step itself (k7 behaviour, not k5); proposal: "nearest folder with a workflow/ directory", needs a behaviour check. (3) Profile switching is not exercised e2e (the e2e shim serves one profile) nor in a real Desktop; no Windows scenario for it yet. (4) macOS: no case/NFD folding, case variants on APFS are different keys. (5) docs/hermes-interfaces.md has no rows yet for ctx.get_config, the hermes_constants profile/WSL helpers and the second-profile route. (6) CLAUDE.md still says 'Build / test: none yet' although make test exists.
+
+2026-11-03 17:27 Ready for review (verksted-worker). make test: 190 agent passed, 58 desktop passed, 0 skipped; e2e (.dev/venv/bin/python -m pytest tests/e2e -q): 28 passed, 0 skipped, incl. new test_11 (step folder inherits the workspace list, widening refused, wire toolsets [file, e2eprobe, no_mcp]); make doctor OK. New rules seen failing against 409221c: test_config.py (all new rules), the k5 tests in test_tool.py / test_plugin_api.py / test_hermes_contract.py, and 6 k5 desktop tests against HEAD's plugin.js. Exercised at ad2b705: ctx.get_config through plugins.entries.verksted.settings, hermes_constants profile helpers, switched-run claim and profile_mismatch (contract probe). Read only: Desktop host.profileRoutes() per-profile routes on one connection (Desktop source); not exercised in a real Desktop. Not exercised on Windows. Not committed; commit-ready.
+
+2026-11-03 17:30 Committed a6365b9 (combined with k6). Moved to done although k4 is still in review awaiting the Windows run; expected. Not exercised on Windows.

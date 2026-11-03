@@ -1,6 +1,6 @@
 ---
 name: verksted
-description: "Run a task or workflow step in a workspace folder."
+description: "Folder tasks and workflow steps in own sessions: run, track."
 author: Torsten Raudssus
 metadata:
   hermes:
@@ -25,9 +25,10 @@ do the child's work in its place, and you never answer for the user.
 
 ## Prerequisites
 
-- The Verksted plugin is enabled for this profile, and its Desktop part is enabled in Hermes
-  Desktop. A Hermes Desktop window connected to this profile starts the child session. Without
-  one, a run waits (`state: "waiting_for_gui"`).
+- The Verksted plugin is enabled for this profile, and its Desktop part is switched on in Hermes
+  Desktop (**Capabilities → Plugins**). A Hermes Desktop window connected to this profile starts
+  the child session. Without one, a run waits (`state: "waiting_for_gui"`), and
+  `desktop_last_poll_s` tells whether the Desktop part has ever checked in for this profile.
 - The folder exists on the machine Hermes runs on, and you pass its absolute path as that machine
   sees it: a drive path such as `C:\Users\ana\Reports` on Windows, the Linux path for a Hermes in WSL.
 
@@ -144,7 +145,7 @@ for the child to look at first. Name every other input in the task text by path.
 | `unanswered` or `blocked` in a finished run | The child asked the user a question that got no answer (nobody had its session open), or a command that needed approval did not run (denied or not approved in time) | Tell the user what it asked or wanted to run; its result may rest on an assumption. The user answers in the child session (**Session öffnen**), or gives you the answer to pass on with `send`. Never approve a command yourself |
 | `waiting_for: "clarify"`, `label: "Rückfrage"` | The child has a question for the user (it is in `prompts`) | Tell the user the question, and that they answer it in Hermes Desktop: **Verksted** in the sidebar, then **Session öffnen**. Do not answer it yourself, even if the user gives you the answer here. Then `wait` again |
 | `waiting_for: "approval"`, `label: "Freigabe erforderlich"` | The child wants to do something that needs the user's approval | The user decides in the child session through **Session öffnen**. Never write "approved" or "genehmigt" anywhere in its place. An approval not given in time counts as denied. Then `wait` |
-| `state: "waiting_for_gui"`, `state: "send_waiting"` | Stored (a follow-up task for `send_waiting`), but no Hermes Desktop window with the Verksted part is connected to this profile | Ask the user to open Hermes Desktop on this profile, then `wait`. Do not start or send it again |
+| `state: "waiting_for_gui"`, `state: "send_waiting"` | Stored (a follow-up task for `send_waiting`), but no Hermes Desktop window with the Verksted part has started it yet. `desktop_last_poll_s` is how many seconds ago such a window last checked in for this profile | With `desktop_last_poll_s: null` none ever has: ask the user to switch on the Verksted part in Hermes Desktop (**Capabilities → Plugins**) and open this profile there. Over 60: ask them to open Hermes Desktop on this profile. 60 or less: a window is there; ask nothing. Then `wait`. Do not start or send it again |
 | `state: "create_requested"`, `state: "session_created"`, `state: "toolsets_checked"`, `state: "submit_requested"`, `state: "running"` | The run is starting or running | `wait` again |
 | `cancel_requested: true`, `label: "wird gestoppt"` | A stop was requested; Hermes has not confirmed it yet | `wait`. The run may still finish; report what `wait` returns |
 | `state: "cancelled"` | Stopped before its task reached Hermes; nothing ran in this turn | Tell the user. Start nothing on your own |

@@ -294,7 +294,7 @@ test('a live claim of another window is skipped', async () => {
   env.api.state.run.claim.live = false // the list still shows it, as an older snapshot would
   const list = await env.api.rest('/runs/claimable')
   list.runs[0].claim = run.claim
-  const w = createWorker({ host: env.host, rest: async (path, opts) => (path === '/runs/claimable' ? list : env.api.rest(path, opts)),
+  const w = createWorker({ host: env.host, rest: async (path, opts) => (path.startsWith('/runs/claimable') ? list : env.api.rest(path, opts)),
     owner: 'win-a', sleep: async () => {} })
   await w.poll()
   assert.ok(!trace(env.log).includes('rest claim'))
@@ -1011,4 +1011,121 @@ test('k8/k10: labels show a pending stop and the run view lists checked outputs'
   }), ['→ runs/r1/notes.md', '→ runs/r1/', '✗ ghost.md (not_found)', '✗ ../x (outside_workspace)',
     'Rückfrage ohne Antwort: Welche Datei?', 'Nicht freigegeben: git push'])
   assert.equal(resultLines({ state: 'finished', result_block: 'missing' }).length, 1)
+})
+
+// -- k9: both switches, an older Desktop ---------------------------------------------------------
+
+const { chipText, isNotFound, missingHostMembers, CHIP_NOTES, HOST_MEMBERS } = plugin
+
+test('k9: the poll names its window, so the plugin API can record who polled', async () => {
+  const env = setup()
+  await worker(env).poll()
+  assert.deepEqual(env.api.state.queries.find(([path]) => path === '/runs/claimable'), ['/runs/claimable', 'owner=win-a'])
+  assert.deepEqual(env.api.state.queries.find(([path]) => path === '/runs'), ['/runs', '']) // the list is no poll
+})
+
+for (const [name, err] of [
+  ['the Desktop bridge', new Error('404: {"detail":"Plugin not found"}')], // electron/api-expected-404.ts
+  ['a statusCode', Object.assign(new Error('Not Found'), { statusCode: 404 })],
+  ['the Linux stand-in', Object.assign(new Error('404 Not Found: {"detail":"Not Found"}'), { status: 404 })]
+]) {
+  test(`k9: a 404 from the plugin API (${name}) says the agent part is not enabled, and claims nothing`, async () => {
+    const env = setup()
+    const rest = async (path, opts) => { if (path.startsWith('/runs/claimable')) throw err; return env.api.rest(path, opts) }
+    const w = createWorker({ host: env.host, rest, owner: 'win-a', sleep: async () => {} })
+    await w.poll()
+    const view = w.getView()
+    assert.ok(view.note.startsWith(`${CHIP_NOTES.agentOff}: `) && /plugins\.enabled/.test(view.note), view.note)
+    assert.equal(view.chip, CHIP_NOTES.agentOff)
+    assert.equal(chipText(view, Date.now()), 'Verksted: Agent-Teil nicht aktiviert')
+    assert.ok(!trace(env.log).includes('rest claim') && calls(env.log, 'runtime.describe').length === 0)
+  })
+}
+
+test('k9: another API failure keeps its own note; the chip shows it clipped, never "0 aktiv"', async () => {
+  const env = setup()
+  const rest = async (path, opts) => { if (path.startsWith('/runs/claimable')) throw new Error(`503: ${'x'.repeat(80)}`); return env.api.rest(path, opts) }
+  const w = createWorker({ host: env.host, rest, owner: 'win-a', sleep: async () => {} })
+  await w.poll()
+  const view = w.getView()
+  assert.match(view.note, /^Verksted-API nicht erreichbar: 503: x+$/)
+  assert.equal(view.chip, null)
+  const text = chipText(view, Date.now())
+  assert.ok(text.startsWith('Verksted: Verksted-API nicht erreichbar') && text.endsWith('…') && text.length === 'Verksted: '.length + 48, text)
+  assert.equal(isNotFound(new Error('503: upstream returned 404 bytes')), false)
+  assert.equal(isNotFound(new Error("Error invoking remote method 'hermes:api': Error: 404: {}")), true)
+})
+
+test('k9: chipText puts a Rückfrage first, then a note, then the count, and hides on nothing', () => {
+  const now = 1000 * 1000
+  const live = { expires_at: 2000 }
+  const asking = { state: 'running', prompts: [{ kind: 'clarify' }], claim: live }
+  const running = { state: 'running', prompts: [], claim: live }
+  const note = { note: 'Kein eindeutiger Verbindungsweg für das aktive Profil gefunden.', chip: null }
+  assert.equal(chipText({ runs: [], note: null, chip: null }, now), null)
+  assert.equal(chipText({ runs: [running, { state: 'finished' }], note: null, chip: null }, now), 'Verksted: 1 aktiv')
+  assert.equal(chipText({ runs: [], ...note }, now), 'Verksted: Kein eindeutiger Verbindungsweg für das aktive…')
+  assert.equal(chipText({ runs: [running], note: 'lang', chip: CHIP_NOTES.tooOld }, now), `Verksted: ${CHIP_NOTES.tooOld}`)
+  assert.equal(chipText({ runs: [running, asking], ...note }, now), 'Verksted: Rückfrage')
+})
+
+test('k9: a successful poll clears the note and its chip', async () => {
+  const env = setup()
+  let fail = true
+  const rest = async (path, opts) => {
+    if (fail && path.startsWith('/runs/claimable')) throw new Error('404: {"detail":"Not Found"}')
+    return env.api.rest(path, opts)
+  }
+  const w = createWorker({ host: env.host, rest, owner: 'win-a', sleep: async () => {} })
+  await w.poll()
+  assert.equal(w.getView().chip, CHIP_NOTES.agentOff)
+  fail = false
+  await w.poll()
+  assert.equal(w.getView().note, null)
+  assert.equal(w.getView().chip, null)
+  assert.equal(env.api.state.run.state, 'running')
+})
+
+for (const member of HOST_MEMBERS) {
+  test(`k9: a Desktop without host.${member} claims nothing and says it is too old (no TypeError)`, async () => {
+    const env = setup()
+    delete env.host[member]
+    assert.deepEqual(missingHostMembers(env.host), [member])
+    const w = worker(env)
+    await w.poll()
+    const view = w.getView()
+    assert.equal(view.note, `${CHIP_NOTES.tooOld}: es fehlt host.${member}. Hermes Desktop aktualisieren; bis dahin startet dieses Fenster keine Aufträge.`)
+    assert.equal(chipText(view, Date.now()), `Verksted: ${CHIP_NOTES.tooOld}`)
+    // No poll (so the tool keeps saying no Desktop part polls this profile), no claim, no gateway call;
+    // the run list still loads for the page.
+    assert.deepEqual(trace(env.log), ['rest /runs'])
+    await w.openSession({ session_id: 's-1', identity: { connection_id: 'local', route_profile: 'default' } })
+    assert.deepEqual(env.log.at(-1), ['notify', { kind: 'error', message: `${CHIP_NOTES.tooOld}: Hermes Desktop aktualisieren.` }])
+  })
+}
+
+test('k9: register on a Desktop without profileRoutes shows the note in the chip and throws nothing', async () => {
+  const env = setup()
+  delete env.host.profileRoutes
+  globalThis.__verkstedHost = env.host
+  const registered = []
+  const warned = []
+  const warn = console.warn
+  console.warn = (...args) => warned.push(args)
+  try {
+    plugin.default.register({
+      registerMany: entries => registered.push(...entries), onEvent: () => {}, setInterval: () => {},
+      onDispose: () => {}, rest: env.api.rest
+    })
+    await ticks(20)
+    const chip = render(registered[0].render())
+    assert.equal(chip.type, 'button')
+    assert.equal(chip.children[0], `Verksted: ${CHIP_NOTES.tooOld}`)
+    assert.match(chip.props.title, /host\.profileRoutes/)
+    assert.deepEqual(warned, [])
+    assert.equal(env.api.state.run.state, 'waiting_for_gui')
+  } finally {
+    console.warn = warn
+    delete globalThis.__verkstedHost
+  }
 })

@@ -33,6 +33,10 @@ INTERRUPT_POLL_S = 0.25   # C18: at least once a second, so /stop returns within
 ACTIONS = ("run", "status", "wait", "send", "cancel")
 _ARG_KEYS = {"action", "folder", "task", "files", "handle", "wait_seconds"}
 _STARTING = ("create_requested", "session_created", "toolsets_checked", "submit_requested")
+_WAITING_FOR_GUI = ("waiting_for_gui", "send_waiting")
+# A Desktop window polls every 15 s (desktop/plugin.js POLL_MS); a poll older than four of them means
+# no window is polling this profile now.
+GUI_POLL_FRESH_S = 60
 
 LABELS = {
     "waiting_for_gui": "wartet auf Hermes Desktop",
@@ -145,14 +149,14 @@ def _dispatch(host: Any, args: Any, kwargs: dict[str, Any], known: dict[str, str
     run = _bound_run(store, caller, args.get("handle"))
     known["handle"] = run["run_id"]
     if action == "status":
-        return _view(run, host.now())
+        return _view(run, host.now(), store=store)
     if action == "send":
         return _send(host, store, caller, run, args)
     if action == "cancel":
         return _cancel(host, store, run, args)
     seconds = _wait_seconds(args, "wait")
     run, why = _wait(host, store, run, seconds)
-    return _view(run, host.now(), wait_end=why)
+    return _view(run, host.now(), wait_end=why, store=store)
 
 
 # -- run ----------------------------------------------------------------------------------------
@@ -216,8 +220,8 @@ def _run(host: Any, store: Any, caller: dict[str, Any], args: dict[str, Any],
     host.ring()
     if seconds:
         run, why = _wait(host, store, run, seconds)
-        return _view(run, host.now(), wait_end=why)
-    return _view(run, host.now())
+        return _view(run, host.now(), wait_end=why, store=store)
+    return _view(run, host.now(), store=store)
 
 
 def _task(args: dict[str, Any], action: str) -> str:
@@ -261,8 +265,8 @@ def _send(host: Any, store: Any, caller: dict[str, Any], run: dict[str, Any], ar
     host.ring()
     if seconds:
         run, why = _wait(host, store, run, seconds)
-        return _view(run, host.now(), wait_end=why)
-    return _view(run, host.now())
+        return _view(run, host.now(), wait_end=why, store=store)
+    return _view(run, host.now(), store=store)
 
 
 def _cancel(host: Any, store: Any, run: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
@@ -276,7 +280,7 @@ def _cancel(host: Any, store: Any, run: dict[str, Any], args: dict[str, Any]) ->
         host.ring()
         if seconds:
             run, why = _wait(host, store, run, seconds)
-    out = _view(run, host.now(), wait_end=why)
+    out = _view(run, host.now(), wait_end=why, store=store)
     out["cancel"] = _cancel_verdict(run)
     return out
 
@@ -366,7 +370,8 @@ def _wait(host: Any, store: Any, run: dict[str, Any], seconds: int) -> tuple[dic
 
 # -- view ---------------------------------------------------------------------------------------
 
-def _view(run: dict[str, Any], now: float, *, wait_end: Optional[str] = None) -> dict[str, Any]:
+def _view(run: dict[str, Any], now: float, *, wait_end: Optional[str] = None,
+          store: Any = None) -> dict[str, Any]:
     state = run["state"]
     prompts = _waiting_for(run)
     waiting = prompts[0]["kind"] if prompts else None
@@ -413,6 +418,10 @@ def _view(run: dict[str, Any], now: float, *, wait_end: Optional[str] = None) ->
     if wait_end is not None:
         out["wait_end"] = wait_end
         out["still_running"] = state in ACTIVE_STATES
+    if state in _WAITING_FOR_GUI and store is not None:
+        # Card k9: whether a Desktop part polls this profile at all; nothing starts the run here.
+        poll = store.last_gui_poll()
+        out["desktop_last_poll_s"] = int(max(0.0, now - poll["at"])) if poll else None
     out["hint"] = _hint(out, state, waiting, stale, wait_end)
     return out
 
@@ -472,15 +481,42 @@ def _hint(out: dict[str, Any], state: str, waiting: Optional[str], stale: bool,
         return ("The child session needs the user's approval (Freigabe erforderlich). Tell the user to "
                 "decide in Hermes Desktop via 'Session öffnen'; an approval not given in time is denied. "
                 "Then call wait with this handle.")
-    if state in ("waiting_for_gui", "send_waiting"):
-        return ("Stored; the run starts as soon as a Hermes Desktop window with the Verksted part enabled "
-                "is connected to this profile. Call wait with this handle.")
+    if state in _WAITING_FOR_GUI:
+        return _waiting_hint(out)
     if stale:
         return ("No Hermes Desktop window is following this run right now; the state shown is the last "
                 "known one (veraltet), not a claim that the run stopped. Call wait or status later.")
     if wait_end == "interrupted":
         return "This call was interrupted; the run keeps going. Call wait or status with the handle."
     return "The run is still going. Call wait with this handle to collect the result."
+
+
+def _waiting_hint(out: dict[str, Any]) -> str:
+    """A stored run nothing has started yet, told apart by the last Desktop poll of this profile
+    (card k9): no Desktop part ever polled, one polled just now, or none for a while."""
+    if "desktop_last_poll_s" not in out:
+        return ("Stored; the run starts as soon as a Hermes Desktop window with the Verksted part enabled "
+                "is connected to this profile. Call wait with this handle.")
+    ago = out["desktop_last_poll_s"]
+    if ago is None:
+        return ("Stored, but no Verksted Desktop part has polled this profile yet: is the Verksted part "
+                "enabled in Hermes Desktop, on a window showing this profile? Ask the user to check (the "
+                "Verksted page there names what is missing); the run starts once it polls. Call wait with "
+                "this handle; do not start the run again.")
+    if ago <= GUI_POLL_FRESH_S:
+        return (f"Stored; a Hermes Desktop window with the Verksted part polled this profile {_ago(ago)} ago, "
+                "so it should start the run with one of its next polls. Call wait with this handle.")
+    return (f"Stored; the last Verksted Desktop poll of this profile was {_ago(ago)} ago, so no window seems "
+            "to be connected now (Hermes Desktop closed, or showing another profile). The run starts once "
+            "one is. Call wait with this handle; do not start the run again.")
+
+
+def _ago(seconds: int) -> str:
+    if seconds < 120:
+        return f"{seconds} s"
+    if seconds < 7200:
+        return f"{seconds // 60} min"
+    return f"{seconds // 3600} h"
 
 
 def _finished_hint(out: dict[str, Any]) -> str:

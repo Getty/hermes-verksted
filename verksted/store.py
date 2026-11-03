@@ -12,6 +12,8 @@ beyond the earlier turns of a run that ``send`` continued (table ``turns``).
 
 Schema 2 (cards k8, k10) adds the stop request, the turn counter with its archive and the states
 ``send_waiting`` and ``cancelled``; a schema-1 store is migrated in place, in one transaction.
+The ``meta`` table also holds the last Desktop poll (card k9), so the tool can tell "no Desktop part
+polls this profile" from "a window polled n seconds ago".
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from typing import Any, Callable, Optional
 
 SCHEMA_VERSION = 2
 PLUGIN_NAME = "verksted"
+# The ``meta`` row of the last Desktop poll; ``meta`` is key/value, so it needs no schema change.
+GUI_POLL_KEY = "last_gui_poll"
 
 # A run is "active" while it holds its folder. The unique partial index below makes "one active run
 # per folder" atomic; the tool checks it first only to name the run that holds the folder.
@@ -385,6 +389,27 @@ class Store:
                          (new_session_id, original))
             return True
         return self._write(op)
+
+    # -- Desktop polls ------------------------------------------------------------------------
+
+    def record_gui_poll(self, *, owner: Optional[str], subject: Optional[str]) -> None:
+        """Note that a Desktop window polled this profile's claimable runs (``GET /runs/claimable``):
+        when, which window (``owner``) and under which principal. One ``meta`` row, overwritten."""
+        def op(conn: sqlite3.Connection, now: float) -> None:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                         (GUI_POLL_KEY, _dumps({"at": now, "owner": owner, "subject": subject})))
+        self._write(op)
+
+    def last_gui_poll(self) -> Optional[dict[str, Any]]:
+        """The last Desktop poll ``{"at", "owner", "subject"}``, or None when no window polled yet."""
+        def op(conn: sqlite3.Connection, now: float) -> Optional[dict[str, Any]]:
+            row = conn.execute("SELECT value FROM meta WHERE key=?", (GUI_POLL_KEY,)).fetchone()
+            try:
+                poll = json.loads(row[0]) if row else None
+            except ValueError:
+                return None
+            return poll if isinstance(poll, dict) and isinstance(poll.get("at"), (int, float)) else None
+        return self._read(op)
 
     # -- claims -------------------------------------------------------------------------------
 

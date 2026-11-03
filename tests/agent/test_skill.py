@@ -153,7 +153,14 @@ def _result_views() -> list[dict]:
         {**base, "state": "waiting_for_gui"},
         {**base, "state": "send_waiting", "turn_no": 2},
     ]
-    return [tool._view(run, 1.0, wait_end=end) for run in runs for end in (None, "timeout")]
+    return [tool._view(run, 1.0, wait_end=end, store=_NeverPolled()) for run in runs for end in (None, "timeout")]
+
+
+class _NeverPolled:
+    """A store no Desktop part has polled (card k9): the waiting views carry desktop_last_poll_s."""
+
+    def last_gui_poll(self):
+        return None
 
 
 def _cancel_verdicts() -> set[str]:

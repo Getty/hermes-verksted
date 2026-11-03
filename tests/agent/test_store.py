@@ -537,3 +537,32 @@ def test_finished_without_a_check_is_reported_missing_never_invented(store):
     ref = _finished(store, claim, outputs=[{"path": "/etc/passwd"}])["result_ref"]
     assert ref["block"] == "missing" and ref["outputs"] == [] and ref["summary"] is None
     assert ref["block_detail"] == "no result check was recorded"
+
+
+def test_the_last_desktop_poll_is_one_meta_row_without_a_schema_change(store, clock, tmp_path):
+    """Card k9: a poll of ``GET /runs/claimable`` is kept in the key/value ``meta`` table, so the
+    tool can tell a profile no Desktop part ever polled from one a window polled n seconds ago."""
+    assert store.last_gui_poll() is None
+    store.record_gui_poll(owner="win-a", subject="user-1")
+    clock.t += 20
+    store.record_gui_poll(owner="win-b", subject=None)
+    assert store.last_gui_poll() == {"at": 1020.0, "owner": "win-b", "subject": None}  # overwritten
+    conn = sqlite3.connect(tmp_path / "data.db")
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+    finally:
+        conn.close()
+    assert set(meta) == {"schema_version", "last_gui_poll"} and meta["schema_version"] == "2"
+    # No run row and no claim changed: a poll is not a claim.
+    assert store.list_runs() == []
+
+
+def test_an_unreadable_poll_row_reads_as_no_poll(store, tmp_path):
+    store.record_gui_poll(owner="win-a", subject=None)
+    conn = sqlite3.connect(tmp_path / "data.db")
+    try:
+        conn.execute("UPDATE meta SET value='not json' WHERE key='last_gui_poll'")
+        conn.commit()
+    finally:
+        conn.close()
+    assert store.last_gui_poll() is None

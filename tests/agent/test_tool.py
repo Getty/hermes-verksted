@@ -551,3 +551,35 @@ def test_schema_matches_the_handler():
     assert props["action"]["enum"] == list(tool.ACTIONS)
     assert props["wait_seconds"]["maximum"] == tool.MAX_WAIT_S == 240
     assert tool.SCHEMA["parameters"]["additionalProperties"] is False
+
+
+def test_waiting_for_gui_says_whether_a_desktop_part_polls_this_profile(host, workspace):
+    """Card k9: the tool cannot see the Desktop, only the last poll of this profile's claimable runs
+    (stored by the plugin API). It tells "never polled" from "polled n s ago" from "not for a while";
+    fail closed either way: the run stays waiting_for_gui and nothing else starts it."""
+    out = run_now(host, workspace)
+    handle = out["handle"]
+    assert out["state"] == "waiting_for_gui" and out["desktop_last_poll_s"] is None
+    assert "no Verksted Desktop part has polled this profile yet" in out["hint"]
+    assert "enabled in Hermes Desktop" in out["hint"]
+
+    host.store_obj.record_gui_poll(owner="vk-win-1", subject=None)
+    host.t += 12
+    out = call(host, {"action": "status", "handle": handle})
+    assert out["state"] == "waiting_for_gui" and out["desktop_last_poll_s"] == 12
+    assert "polled this profile 12 s ago" in out["hint"]
+
+    host.t += 600
+    out = call(host, {"action": "wait", "handle": handle, "wait_seconds": 5})
+    assert out["state"] == "waiting_for_gui" and out["wait_end"] == "timeout"
+    assert out["desktop_last_poll_s"] == 617 and "was 10 min ago" in out["hint"]
+    assert "no window seems to be connected" in out["hint"]
+    run = host.store_obj.get_run(handle)
+    assert run["state"] == "waiting_for_gui" and run["claim_generation"] == 0 and host.rings == 1
+
+
+def test_only_a_run_nothing_started_reports_the_desktop_poll(host, workspace):
+    handle = run_now(host, workspace)["handle"]
+    host.store_obj.record_gui_poll(owner="vk-win-1", subject=None)
+    _make_child(host, handle, "local-child")
+    assert "desktop_last_poll_s" not in call(host, {"action": "status", "handle": handle})

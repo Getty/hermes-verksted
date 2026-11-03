@@ -1,6 +1,18 @@
 Revision history for Verksted
 
 {{$NEXT}}
+  - status and wait on a run still waiting for the Desktop part say whether
+    a Verksted Desktop part has polled this profile and how long ago
+    (desktop_last_poll_s); nothing is restarted because of it.
+  - The Desktop status chip shows the window's note: "Agent-Teil nicht
+    aktiviert" on a 404 from the plugin API, "Hermes Desktop zu alt für
+    Verksted" when the host lacks profileRoutes, requestProfile,
+    retainProfile or openSession; such a window starts nothing.
+  - make package builds dist/verksted-<version>.zip from the committed
+    tree; make install copies the committed package into a Hermes home under
+    .dev/ and drops a stale Desktop copy.
+  - The bundled skill tells a never-polled Desktop part from a closed
+    Desktop, and its description says when to load it.
   - verksted cancel stops a running turn through prompt.cancel and reports it
     only once Hermes confirms; a run Hermes never saw ends cancelled.
     verksted send runs a follow-up turn in the same child session.

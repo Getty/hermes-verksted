@@ -1,10 +1,10 @@
 """Verksted plugin API, mounted by Hermes under ``/api/plugins/verksted``.
 
-The Desktop part reaches it through ``ctx.rest`` to list claimable runs, claim one (lease plus
-claim generation) and record each start step. Host authentication is the dashboard's own
-middleware, which runs before this router (a native ``X-Hermes-Gateway-Ticket`` from Desktop, or
-the session token); this module adds no credential of its own and reads the authenticated
-principal from ``request.state.native_http_principal``.
+The Desktop part reaches it through ``ctx.rest`` to list claimable runs (each such poll is
+recorded, card k9), claim one (lease plus claim generation) and record each start step. Host
+authentication is the dashboard's own middleware, which runs before this router (a native
+``X-Hermes-Gateway-Ticket`` from Desktop, or the session token); this module adds no credential of
+its own and reads the authenticated principal from ``request.state.native_http_principal``.
 
 Hermes imports this file standalone by path, possibly in another process than the agent plugin,
 so the shared ``store.py`` one folder up is loaded by path too. Request and response bodies
@@ -21,7 +21,9 @@ gets the reason; ``ctx.rest`` turns non-2xx answers into bare errors.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -29,6 +31,8 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from starlette.concurrency import run_in_threadpool
+
+_log = logging.getLogger(__name__)
 
 LEASE_DEFAULT_S = 180.0
 LEASE_MIN_S = 30.0
@@ -187,10 +191,23 @@ def _call(fn, *args: Any, **kwargs: Any):
     return run_in_threadpool(fn, *args, **kwargs)
 
 
-def _list(claimable_only: bool) -> dict[str, Any]:
-    store, now = _store(), _now()
+def _list(claimable_only: bool, store: Any = None) -> dict[str, Any]:
+    store, now = store or _store(), _now()
     runs = store.claimable_runs(limit=20) if claimable_only else store.list_runs(limit=50)
     return {"ok": True, "profile_home": _profile_home(), "runs": [_summary(r, now) for r in runs]}
+
+
+def _poll(owner: Any, principal: dict[str, Any]) -> dict[str, Any]:
+    """A Desktop window's poll: recorded first (card k9, the tool's waiting_for_gui answer), then
+    answered with the claimable runs. A poll the store cannot record still gets its list."""
+    owner = owner if isinstance(owner, str) and 0 < len(owner) <= OWNER_MAX else None
+    subject = principal.get("subject")
+    store = _store()
+    try:
+        store.record_gui_poll(owner=owner, subject=str(subject) if subject else None)
+    except sqlite3.Error:
+        _log.warning("verksted: could not record the Desktop poll", exc_info=True)
+    return _list(True, store)
 
 
 def _claim(run_id: str, body: dict[str, Any], principal: dict[str, Any]) -> dict[str, Any]:
@@ -262,8 +279,8 @@ async def list_runs() -> dict[str, Any]:
 
 
 @router.get("/runs/claimable")
-async def claimable() -> dict[str, Any]:
-    return await _answer(_list, True)
+async def claimable(request: Request) -> dict[str, Any]:
+    return await _answer(_poll, request.query_params.get("owner"), _principal(request))
 
 
 @router.post("/runs/{run_id}/claim")

@@ -125,10 +125,13 @@ const FINAL = ['finished', 'refused', 'unknown', 'cancelled']
 /** The plugin API as the Desktop part sees it through ctx.rest: one run, claims and steps.
  *  `subject`: the principal subject the host authenticates this window's requests as. */
 export function makeApi(run, { log = [], refuse = {}, mode, subject = null } = {}) {
-  const state = { run: structuredClone(run), generation: run.claim ? run.claim.generation : 0, bodies: [] }
-  const rest = async (path, opts) => {
+  const state = { run: structuredClone(run), generation: run.claim ? run.claim.generation : 0, bodies: [], queries: [] }
+  const rest = async (fullPath, opts) => {
     const body = opts && opts.body
     state.bodies.push(body)
+    // The log keeps the bare path; the query (the poll's ?owner=) is kept apart for the tests that read it.
+    const [path, query = ''] = fullPath.split('?')
+    state.queries.push([path, query])
     const parts = path.split('/').filter(Boolean)
     if (!opts) {
       log.push(['rest', path])

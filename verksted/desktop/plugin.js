@@ -57,6 +57,14 @@ export const RESULT_BLOCK_LABELS = Object.freeze({
   missing: 'kein Ergebnisblock', unparsable: 'Ergebnisblock unlesbar'
 })
 export const WAITING_LABELS = Object.freeze({ clarify: 'Rückfrage', approval: 'Freigabe erforderlich' })
+// The SDK host members this part calls that an older Hermes Desktop lacks (ad2b705: openSession
+// came 2026-08-12, profileRoutes and requestProfile 2026-08-14, retainProfile 2026-08-24). Without
+// them this window claims nothing and says so, rather than failing mid-start with a TypeError.
+export const HOST_MEMBERS = Object.freeze(['profileRoutes', 'requestProfile', 'retainProfile', 'openSession'])
+export const CHIP_NOTES = Object.freeze({
+  agentOff: 'Agent-Teil nicht aktiviert', tooOld: 'Hermes Desktop zu alt für Verksted'
+})
+const CHIP_NOTE_MAX = 48
 const STARTED = ['create_requested', 'session_created', 'toolsets_checked', 'submit_requested', 'running']
 const FINAL = ['finished', 'refused', 'unknown', 'cancelled']
 const CLAIM_GONE = ['stale_generation', 'lease_expired', 'final', 'not_found']
@@ -100,6 +108,18 @@ export function guardCall(method, params) {
 
 export const isRpcError = err => !!err && typeof err.code === 'number'
 
+/** The host members of HOST_MEMBERS this Desktop does not offer. */
+export const missingHostMembers = host => HOST_MEMBERS.filter(name => !host || typeof host[name] !== 'function')
+
+/** A 404 from ctx.rest: the profile's backend does not serve this plugin's API, because the agent
+ *  part is not enabled there (hermes_cli/web_server.py:435) or not installed. The renderer gets
+ *  `Error('404: <body>')` (apps/desktop/electron/api-expected-404.ts), maybe with a statusCode; the
+ *  status leads the message, or follows Electron's "Error invoking remote method …: Error: " prefix. */
+export function isNotFound(err) {
+  const status = err && typeof err === 'object' ? (err.statusCode ?? err.status) : undefined
+  return Number(status) === 404 || /(?:^|Error: )404\b/.test(String((err && err.message) || err))
+}
+
 /** A refusal that says "not now" rather than "no": the gateway drains for a restart (4001
  *  runtime_draining, gateway/drain_control.py:81-90) or its storage failed (5001). Like a lost
  *  reply it is tried again later and never counts toward giving a run up. */
@@ -135,8 +155,9 @@ export function sameIdentity(stored, current) {
 /** What a child session waits on the user for, from one `session.resume` snapshot. The canonical
  *  client sends `clarify_batch: true` with every `prompt.submit` (apps/desktop/src/api/client.ts), so a
  *  Rückfrage arrives as a `clarify` server request in `open_requests`, not in `prompts[]`; approvals
- *  come in `prompts[]`, or as an `approval` server request. Other blocking requests (sudo, secret, …)
- *  count as a Rückfrage, named by their method only: their params can carry what the user types.
+ *  come in `prompts[]`, or as an `approval` server request. Other blocking requests (a password or
+ *  secret prompt, …) count as a Rückfrage, named by their method only: their params can carry what
+ *  the user types.
  *  The client also copies every `prompts[]` entry into `open_requests` under its prompt id
  *  (canonical-protocol.ts:756-758), so each id counts once. */
 export function pendingPrompts(snapshot) {
@@ -320,7 +341,9 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
   //            release (the route retain), cancelRequested, cancelSent }
   const held = new Map()
   const listeners = new Set()
-  let view = { runs: [], profileHome: null, note: null, updatedAt: null }
+  // note: what keeps this window from working, in full (the page, the chip's tooltip); chip: its
+  // short form for the status chip, when the note has one.
+  let view = { runs: [], profileHome: null, note: null, chip: null, updatedAt: null }
   let polling = null
   let pollAgain = false
   let disposed = false
@@ -333,6 +356,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
     view = { ...view, ...patch }
     for (const fn of listeners) fn()
   }
+  const setNote = (note, chip = null) => publish({ note, chip })
 
   const scope = () => {
     const fromHost = typeof host.activeConnectionId === 'function' ? host.activeConnectionId() : null
@@ -569,7 +593,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
     const routes = await host.profileRoutes()
     const active = pickRoute(routes, scope())
     if (!active) {
-      publish({ note: 'Kein eindeutiger Verbindungsweg für das aktive Profil gefunden.' })
+      setNote('Kein eindeutiger Verbindungsweg für das aktive Profil gefunden.')
       return
     }
     // The session runs in the profile frozen at run (k5), on this window's connection: the store and
@@ -601,7 +625,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
           // refusal (draining :296-304, storage 5001 :373-377, permission :534-538) is this
           // gateway's state now: claim nothing, a later poll or another window tries again.
           const f = failureOf(err)
-          publish({ note: `runtime.describe refused (${f.reason || f.code}): ${f.detail}. Der Auftrag wartet.` })
+          setNote(`runtime.describe refused (${f.reason || f.code}): ${f.detail}. Der Auftrag wartet.`)
           return
         }
         gate = { reason: 'legacy_route', detail: 'runtime.describe is unknown on this route (legacy gateway); Verksted needs the canonical gateway' }
@@ -616,7 +640,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
       owner, lease_s: LEASE_S, profile_id: (describe && describe.profile_id) || null
     })
     if (!claim || claim.ok !== true) {
-      if (!claim || claim.code !== 'claimed') publish({ note: `Claim abgelehnt: ${(claim && (claim.message || claim.code)) || 'keine Antwort'}` })
+      if (!claim || claim.code !== 'claimed') setNote(`Claim abgelehnt: ${(claim && (claim.message || claim.code)) || 'keine Antwort'}`)
       return
     }
     held.set(runId, { generation: claim.generation, tracking: false, failures: 0, busy: false })
@@ -759,18 +783,33 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
   }
 
   async function pollOnce() {
+    // Too old a Desktop claims nothing: it could not start or follow a run. It does not poll either,
+    // so the tool keeps saying that no Desktop part polls this profile.
+    const missing = missingHostMembers(host)
+    if (missing.length) {
+      setNote(`${CHIP_NOTES.tooOld}: es fehlt ${missing.map(name => `host.${name}`).join(', ')}. ` +
+        'Hermes Desktop aktualisieren; bis dahin startet dieses Fenster keine Aufträge.', CHIP_NOTES.tooOld)
+      return
+    }
     let list
     try {
-      list = await api('/runs/claimable')
+      // The owner names this window in the poll the plugin API records for the tool's
+      // waiting_for_gui answer ("last Desktop poll … ago").
+      list = await api(`/runs/claimable?owner=${enc(owner)}`)
     } catch (err) {
-      publish({ note: `Verksted-API nicht erreichbar: ${(err && err.message) || err}` })
+      if (isNotFound(err)) {
+        setNote(`${CHIP_NOTES.agentOff}: die Verksted-API dieses Profils antwortet 404. Das Verksted-Plugin ` +
+          'für dieses Profil aktivieren (plugins.enabled), dann das Gateway neu starten.', CHIP_NOTES.agentOff)
+      } else {
+        setNote(`Verksted-API nicht erreichbar: ${(err && err.message) || err}`)
+      }
       return
     }
     if (!list || list.ok !== true) {
-      publish({ note: `Verksted-API: ${(list && (list.message || list.code)) || 'keine Antwort'}` })
+      setNote(`Verksted-API: ${(list && (list.message || list.code)) || 'keine Antwort'}`)
       return
     }
-    publish({ note: null })
+    setNote(null)
     for (const summary of list.runs || []) {
       if (disposed) return
       if (held.has(summary.run_id)) continue
@@ -779,7 +818,7 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
         await take(summary)
       } catch (err) {
         log('verksted: run', summary.run_id, err)
-        publish({ note: `${summary.run_id}: ${(err && err.message) || err}` })
+        setNote(`${summary.run_id}: ${(err && err.message) || err}`)
       }
     }
   }
@@ -865,6 +904,10 @@ export function createWorker({ host, rest, owner, log = () => {}, sleep, now = (
 
   async function openSession(run) {
     const ident = (run && run.identity) || {}
+    if (missingHostMembers(host).length) {
+      host.notify && host.notify({ kind: 'error', message: `${CHIP_NOTES.tooOld}: Hermes Desktop aktualisieren.` })
+      return
+    }
     const routes = await host.profileRoutes()
     const route = (routes || []).find(r => r && r.connectionId === ident.connection_id && r.profile === ident.route_profile)
     if (!route || !run.session_id) {
@@ -933,13 +976,23 @@ function useView(worker) {
   return view
 }
 
+/** The status chip's text, or null to hide it: a Rückfrage or Freigabe first, then a note (its short
+ *  form, else the note clipped) rather than a healthy-looking count, then the active runs. */
+export function chipText(view, now) {
+  const active = view.runs.filter(run => !FINAL.includes(run.state))
+  const waiting = active.map(run => labelOf(run, now)).find(label => label.waiting)
+  if (waiting) return `Verksted: ${waiting.text}`
+  if (view.note) {
+    const note = view.chip || view.note
+    return `Verksted: ${note.length > CHIP_NOTE_MAX ? `${note.slice(0, CHIP_NOTE_MAX - 1).trimEnd()}…` : note}`
+  }
+  return active.length ? `Verksted: ${active.length} aktiv` : null
+}
+
 function StatusChip({ worker, host }) {
   const view = useView(worker)
-  const now = Date.now()
-  const active = view.runs.filter(run => !FINAL.includes(run.state))
-  if (!active.length && !view.note) return null
-  const waiting = active.map(run => labelOf(run, now)).find(label => label.waiting)
-  const text = waiting ? `Verksted: ${waiting.text}` : `Verksted: ${active.length} aktiv`
+  const text = chipText(view, Date.now())
+  if (!text) return null
   return h('button', {
     type: 'button',
     className: 'px-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',

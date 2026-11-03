@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import sqlite3
 
 import pytest
 from fastapi import FastAPI, Request
@@ -390,3 +391,31 @@ def test_a_follow_up_turn_is_claimed_in_start_mode_with_its_own_submission(api):
     assert granted["run"]["submission_id"] == f"{rid}.submit.2" and granted["run"]["prompt_text"] == "two + suffix"
     assert granted["run"]["session_id"] == "s-1" and granted["run"]["turn"] == 2
     assert granted["run"]["effective_toolsets"] is None or isinstance(granted["run"]["effective_toolsets"], list)
+
+
+def test_a_claimable_poll_records_the_window_and_the_principal(api):
+    """Card k9: only ``GET /runs/claimable`` (the Desktop part's poll) is recorded, with the window's
+    owner from the query and the subject the host authenticated; listing runs records nothing."""
+    api.store.create_run(run_record(), max_active=4)
+    api.get("/runs")
+    assert api.store.last_gui_poll() is None
+    api.clock.t += 5
+    listed = api.get("/runs/claimable?owner=vk-win-1", subject="user-1")
+    assert listed["ok"] and len(listed["runs"]) == 1
+    assert api.store.last_gui_poll() == {"at": api.clock.t, "owner": "vk-win-1", "subject": "user-1"}
+    # An owner that is no window id is not stored; the poll still counts.
+    api.get("/runs/claimable?owner=" + "x" * 129)
+    assert api.store.last_gui_poll() == {"at": api.clock.t, "owner": None, "subject": None}
+    # Recording is no claim: the run stays claimable.
+    assert api.store.get_run(run_record()["run_id"])["claim_generation"] == 0
+
+
+def test_a_poll_the_store_cannot_record_still_lists(api, monkeypatch):
+    api.store.create_run(run_record(), max_active=4)
+
+    def locked(**_):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(api.store, "record_gui_poll", locked)
+    listed = api.get("/runs/claimable?owner=vk-win-1")
+    assert listed["ok"] and [r["run_id"] for r in listed["runs"]] == [run_record()["run_id"]]

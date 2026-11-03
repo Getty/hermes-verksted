@@ -1,0 +1,36 @@
+---
+claimed_at: 2026-11-03T19:34:25Z
+claimed_by: verksted-test-writer
+class: standard
+completed: 2026-11-03T19:34:25Z
+created: 2026-11-03T18:22:54Z
+id: 11
+priority: high
+started: 2026-11-03T18:22:59Z
+status: done
+tags:
+- tests
+- e2e
+- acceptance
+title: 'e2e: harness update-check flake, remaining k8/k10 acceptance scenarios, lean-profile
+  MCP, package tests, windows-acceptance rows'
+updated: 2026-11-03T19:34:25Z
+---
+
+Test-writer lane, follows k8/k10 (e19d55b) and runs alongside k9.
+
+1. Harness flake: a teardown ERROR in test_harness_smoke.py::test_plugin_tool_is_deferred_behind_tool_search_by_default — the harness SIGKILLed a "git ls-remote --tags origin refs/tags/v0.22.6" (+ git-remote-https to github.com/NousResearch/hermes-agent) spawned by the Hermes backend in the throwaway home. Turn the update check off in the harness home, keep the SIGKILL assertion.
+2. e2e scenarios not yet covered after k8/k10: Rückfrage with no viewer -> unanswered in the result; approval timeout -> blocked; two concurrent Rückfragen in two child sessions answered in reverse order; takeover in create_requested; cancel before the GUI -> cancelled; send after the child was orphan-closed; missing/unparsable result block.
+3. k9 test items: lean-profile MCP e2e (disabled server never spawns; enabled server -> toolsets_exceeded, spawned once), tests/agent/test_package.py (version sync plugin.yaml/manifest.json/Changes, package contents).
+4. docs/windows-acceptance.md: :65 result expectation, :290 cancel, rows for cancel/send/P1/gateway kill/outputs/unanswered/blocked/lean profile, §0 PowerShell install from the zip.
+5. Stale comment tests/e2e/vk_e2e/user.py:35-36.
+
+2026-11-03 19:38 Progress (test-writer; Hermes ad2b705; Linux only, NOT exercised on Windows). Flake: updates.check=false in the harness config (hermes_cli/banner.prefetch_update_check -> source_check.check_for_updates(passive=True) returns 'disabled'); SIGKILL assertion untouched. New e2e in tests/e2e/test_verksted_k11_e2e.py: 17 unanswered, 18 blocked (approvals.timeout 5), 19 two Rueckfragen reverse, 20 takeover in create_requested, 21 cancel before GUI, 22/23 missing/unparsable block, 24 send after orphan close, lean + fat MCP. tests/agent/test_package.py, docs/windows-acceptance.md rows L-S + section 0 PowerShell, user.py comment. Full e2e run pending.
+
+2026-11-03 18:42 Done (test-writer; Hermes ad2b705; Linux only, NOT exercised on Windows). e2e: 43 passed, 0 failed/skipped/errors in 472 s (.dev/venv/bin/python -m pytest tests/e2e -q); make test: agent 258 passed, desktop 89 passed. Choices (mine): update flake switched off with updates.check=false in the harness config (passive check returns reason disabled); fat-profile test asserts the corrected truth (no_mcp sent, run not refused, server spawned once); Rueckfrage-without-viewer is made by window disconnect while the model call is gated; send after orphan close is accepted by Hermes (same session, turn 2). One fat-profile first run failed with KeyError while the worker was editing tool.py; passed on re-run. Mutation check done only for test_package version sync; e2e tests not mutation-run against product code. docs/windows-acceptance.md scenarios L-S, section 0 PowerShell block. Proposed commit: test: e2e for unanswered, blocked, concurrent Rueckfragen, takeover, early cancel, orphan send, result-block, MCP; package tests; windows rows (k11)
+
+2026-11-03 k9 follow-up (test-writer; Hermes ad2b705; Linux only, NOT exercised on Windows). New e2e test_k9_waiting_answer_tells_never_polled_then_polled_and_nothing_starts in tests/e2e/test_verksted_k11_e2e.py, own fresh backend (poll record is per profile): (a) only a window without the Verksted part -> desktop_last_poll_s null, hint 'no Verksted Desktop part has polled'; run cancelled to free folder; (b) a Verksted window ticks once, closes -> new run waiting_for_gui, desktop_last_poll_s int <60, hint 'polled this profile ... should start the run', no session_id/admission_id in store, no session.create, child model never asked. The 'no window seems connected' branch (>60 s) is NOT covered e2e (unit only). Not mutation-run against product code. e2e: 44 passed, 0 failed/skipped/errors in 610 s; make test: agent 258 passed, desktop 89 passed.
+
+Finding: on a git-checkout install Hermes (ad2b705, hermes_cli/version_info.py) resolves its version via 'git tag --merged HEAD' under a 3 s timeout and falls back to the nearest CalVer tag (0.21.5) on timeout; under load the verksted plugin was then skipped by requires_hermes >=0.22.6 (test_18 failure). Packaged builds use the install stamp. Added to tests/e2e harness: preflight() resolves the pinned Hermes version once per session in the venv and fails if it does not satisfy plugin.yaml requires_hermes or takes >1.5 s (message: run make dev-env, commit-graph); Backend.check_plugins_loaded() scans home/logs errors/agent/gateway.log for "Plugin '<name>' skipped:" for installed plugins, called after start() and at Env teardown (error raised by the fixtures after all envs stop). Detector verified against the real kept failing home of test_18 (prints the skipped line). Full e2e run: 44 passed, 0 failed/skipped/errors, 555 s. Hermes ad2b705, Linux; nothing exercised on Windows.
+
+Committed as 17ca6c1

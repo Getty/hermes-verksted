@@ -24,7 +24,7 @@ acceptance runs are still open (`docs/windows-acceptance.md`). **On Windows, sta
 ## Delegation
 
 Delegate behavior-relevant code to the right agent instead of touching it yourself —
-principle in the shared rule `getty-agent-delegation`, lanes in `.claude/rules/verksted-rules.md`.
+principle in the shared rule `agent-delegation`, lanes in `.claude/rules/verksted-rules.md`.
 
 | Task | Agent |
 |---|---|

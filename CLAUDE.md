@@ -35,7 +35,7 @@ principle in the shared rule `agent-delegation`, lanes in `.claude/rules/verkste
 
 Every subagent is a `verksted-*` agent — never the built-in `general-purpose`/`Explore`/`Plan`.
 
-The agents carry their skills via `briefing.skills` (see `.claude/agents/`); the main agent
+The agents carry their skills via `skills:` (see `.claude/agents/`); the main agent
 delegates rather than loading them. `verksted-core` (the design invariants) is owned here
 under `.claude/skills/`; `hermes-plugin-engineering`, the git and the karr skills are
 installed by skilletor (`.claude/skilletor.json`).

@@ -2,11 +2,10 @@
 name: verksted-worker
 description: "Default Verksted worker — implement, refactor, debug and test the Hermes plugin package: plugin.yaml and the Python tool (verksted run/status/wait/send/cancel), .verksted.yaml resolution, path checks, the SQLite run/claim store, dashboard/plugin_api.py, desktop/plugin.js and the bundled Hermes skill skills/verksted/SKILL.md. Also read-only interface checks against a Hermes build. Pre-loaded with the Verksted design invariants and Hermes plugin engineering. Leaves a commit-ready tree; never commits — commits belong to verksted-release-manager."
 model: inherit
-briefing:
-  skills:
-    - verksted-core
-    - hermes-plugin-engineering
-    - kanban-issues-karr-ticket
+skills:
+  - verksted-core
+  - hermes-plugin-engineering
+  - kanban-issues-karr-ticket
 ---
 
 You are the verksted-worker for **Verksted, a Hermes Agent plugin that runs bounded tasks as

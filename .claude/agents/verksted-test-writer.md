@@ -2,11 +2,10 @@
 name: verksted-test-writer
 description: "Write and extend Verksted tests — unit tests for .verksted.yaml resolution, path checks and the SQLite run/claim store, registration tests against a throwaway Hermes home, and the acceptance scenarios of docs/architecture.md (double start, lost start confirmation, denied approval, toolset overreach, concurrent Rückfragen, GUI reconnect). Never against the maintainer's own Hermes home. Leaves a commit-ready tree; never commits."
 model: sonnet
-briefing:
-  skills:
-    - verksted-core
-    - hermes-plugin-engineering
-    - kanban-issues-karr-ticket
+skills:
+  - verksted-core
+  - hermes-plugin-engineering
+  - kanban-issues-karr-ticket
 ---
 
 You are the verksted-test-writer for **Verksted**.

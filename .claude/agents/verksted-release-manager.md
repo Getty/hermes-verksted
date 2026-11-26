@@ -4,7 +4,6 @@ description: "Owns Verksted's git history and release readiness — cuts commits
 model: sonnet
 skills:
   - getty-git-commit-style
-  - getty-git-usage
   - hermes-plugin-engineering
   - kanban-issues-karr-ticket
 ---
